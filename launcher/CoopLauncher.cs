@@ -507,7 +507,7 @@ namespace SH2CoopMod
 
     class MainForm : Form
     {
-        const string Version = "0.17";
+        const string Version = "0.20";
         const string Author = "MarySue";
         const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
@@ -518,8 +518,8 @@ namespace SH2CoopMod
         static readonly string[] ToggleKeys = { "share_inventory", "host_inventory_wins", "share_ammo", "share_healing", "share_documents",
             "share_key_items", "show_other_player", "show_held_items", "sync_flashlight", "flashlight_shadows", "show_my_model_to_me",
             "sync_doors", "other_player_collision", "friendly_fire", "sync_cutscenes", "sync_enemies", "sync_puzzles", "sync_pushables",
-            "sync_saves" };
-        static readonly string[] ToggleDefaults = { "1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1", "1", "0", "0", "1", "1", "1", "1", "1" };
+            "sync_saves", "unlimited_ammo", "sync_story", "shared_death" };
+        static readonly string[] ToggleDefaults = { "1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1", "1", "0", "0", "1", "1", "1", "1", "1", "0", "1", "1" };
         static readonly int[] SendRates = { 30, 15, 10 };
 
         readonly bool demo;
@@ -914,19 +914,22 @@ namespace SH2CoopMod
         // Everything about the shared world: what both games keep in step.
         void BuildWorldPage(Panel p)
         {
-            Card world = PutCard(p, "Shared world", 0, 0, 335, 286);
-            PutToggle(world, "sync_puzzles", 16, 40, 303, "Puzzles", "Solved by one of us, solved for both");
-            PutToggle(world, "sync_doors", 16, 86, 303, "Doors", "Open, close and unlock for both players");
-            PutToggle(world, "sync_pushables", 16, 132, 303, "Pushable objects", "Furniture one of us pushes moves for both");
-            PutToggle(world, "sync_cutscenes", 16, 178, 303, "Cutscenes", "Watch together, then regroup at the host");
-            PutToggle(world, "sync_saves", 16, 224, 303, "Save and load together", "Joiner saves and loads when the host does");
+            Card world = PutCard(p, "Shared world", 0, 0, 335, 378);
+            PutToggle(world, "sync_story", 16, 40, 303, "Story moments", "Triggers, switches, drawers and pickup events");
+            PutToggle(world, "sync_puzzles", 16, 86, 303, "Puzzles", "Solved by one of us, solved for both");
+            PutToggle(world, "sync_doors", 16, 132, 303, "Doors", "Open, close and unlock for both players");
+            PutToggle(world, "sync_pushables", 16, 178, 303, "Pushable objects", "Furniture one of us pushes moves for both");
+            PutToggle(world, "sync_cutscenes", 16, 224, 303, "Cutscenes", "Watch together, then regroup at the host");
+            PutToggle(world, "sync_saves", 16, 270, 303, "Stay in the host's save", "When the host loads, the joiner joins that load");
+            PutToggle(world, "shared_death", 16, 316, 303, "Die together", "If one of us dies, both restart from the host's save");
 
-            Card combat = PutCard(p, "Combat", 347, 0, 335, 214);
+            Card combat = PutCard(p, "Combat", 347, 0, 335, 260);
             PutToggle(combat, "sync_enemies", 16, 40, 303, "Shared enemies", "Same health and targets; they hunt both of us");
-            PutToggle(combat, "friendly_fire", 16, 86, 303, "Friendly fire", "My attacks hurt them; a shot counts double");
-            PutSlider(combat, "ff_hit_damage", 16, 136, 303, "Damage per melee hit", 5, 30, 1, " hp");
+            PutToggle(combat, "unlimited_ammo", 16, 86, 303, "Unlimited ammo", "For both players if either of us turns it on");
+            PutToggle(combat, "friendly_fire", 16, 132, 303, "Friendly fire", "My attacks hurt them; a shot counts double");
+            PutSlider(combat, "ff_hit_damage", 16, 182, 303, "Damage per melee hit", 5, 30, 1, " hp");
 
-            Card note = PutCard(p, null, 347, 226, 335, 136);
+            Card note = PutCard(p, null, 347, 272, 335, 136);
             PutWrapped(note, "These apply straight away, also mid-game, and both players should use the same choices.",
                 Role.Muted, 12f, 16, 16, 303, 40);
             PutWrapped(note, "Health is never shared. If you get separated, press F7 in game or use Go to other player on the Session page.",

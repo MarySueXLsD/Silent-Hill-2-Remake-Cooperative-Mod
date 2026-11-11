@@ -36,18 +36,21 @@ The launcher:
 |---|---|
 | **The other player** | Visible in your world with full-body animation, their equipped weapon, flashlight and radio, and a real flashlight beam that lights your surroundings |
 | **Inventory** | One inventory for both: ammunition, healing items, documents, weapons, keys and puzzle items. Each kind can be switched off |
-| **Pickups** | An item taken by one player is taken for both |
+| **Pickups** | An item taken by one player is taken for both, with the game's own "collected" popup and "new" mark for both |
+| **Story moments** | Story triggers, one-shot events, switches, drawers and cupboard doors set off by one player go off in both games, and what the level hangs on a pickup ("when the coin is taken, ...") runs in both |
 | **Puzzles** | Solved by one player, solved for both: safes, padlocks, door locks, cabinet puzzles, valves |
 | **Doors** | Open, close and unlock for both, and react to the other player walking through |
 | **Pushable objects** | Furniture one player pushes moves for both |
 | **Cutscenes** | Both players watch together, then carry on side by side where the host is |
-| **Enemies** | Same health and deaths for both, and they hunt whichever player is closer |
+| **Enemies** | Same health for both, and a kill by one player is a death in both games, played as the enemy's own death. They hunt whichever player is closer |
+| **Gunshots** | The other player's shots are heard from where they stand, with a muzzle flash |
+| **Death** | One life for the pair: when either player dies, both restart from the host's last save. The one still standing is told why |
 | **Joining** | The joiner picks **Join co-op** in the game's main menu and loads straight into the host's game, beside them. No need to have the same save |
-| **Saving and loading** | The joiner saves when the host saves, and loads when the host loads |
+| **Loading** | Whenever the host loads a save (or the pair restarts), the joiner is taken back through the main menu into that same load, by itself |
 | **Characters** | Play as James, Maria, Angela or Mary, for the other player and on your own screen |
 
 Kept separate on purpose: health, and the map and item-inspection screens.
-Optional extras: collision between the players, and friendly fire.
+Optional extras: unlimited ammunition, collision between the players, and friendly fire.
 
 The intended way to play: you share one inventory, one of you works a puzzle with the items you
 found, and when it is solved the story moves on for both.
@@ -56,10 +59,18 @@ found, and when it is solved the story moves on for both.
 
 - The mod is new. Most of it has been checked by one player against a simulated partner, and
   full two-player sessions have had little testing so far. Please report what breaks.
-- Not shared yet: half-finished puzzle progress (one player does the puzzle), enemies from
-  scripted groups and bosses, sliding doors opening and closing, plain switches, item
-  containers and elevators. Press **F7** to jump to the other player if something separates you.
-- If the host deliberately loads an older save slot, the joiner gets their own latest save.
+- Not shared yet: half-finished puzzle progress (one player does the puzzle), bosses, sliding
+  doors opening and closing, item containers and elevators. Press **F7** to jump to the other
+  player if something separates you.
+- Each game still runs its own copy of every enemy. Health, deaths and who they hunt are kept
+  the same, and the joiner's copies are nudged to where the host's are, but the two copies are
+  not animated in lockstep. A hit by the other player makes an enemy flinch or fall only for the
+  enemy kinds that accept it (mannequins do; lying figures only take the death).
+- The story sharing, the shared death and the enemy changes of 0.20 were checked on one PC by
+  feeding the mod the other player's messages; they have not yet been played between two PCs.
+- The mod keeps a crash guard: before it asks the game for something on the other player's
+  behalf it leaves a note, and if the game goes down right after the same thing twice, that one
+  thing is skipped for three days (see `ipc\skip.txt` in the mod folder; delete it to reset).
 - Both players need the same game build and the same version of the mod.
 - Joining from the main menu copies the host's current save to the joiner. It goes into a spare
   save slot (number 9) that the game's own menus do not use; the joiner's own saves are left

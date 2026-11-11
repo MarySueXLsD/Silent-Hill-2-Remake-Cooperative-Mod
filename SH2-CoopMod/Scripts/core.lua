@@ -25,7 +25,7 @@
 local ctx = ...
 local UEHelpers = ctx.UEHelpers
 local log = ctx.log
-local VERSION = "0.17"
+local VERSION = "0.20"
 
 local DIR = ctx.root .. "\\ipc"
 local OUT_FILE = DIR .. "\\out.txt"
@@ -65,6 +65,87 @@ local function warnOnce(key, msg)
     if not S.warned[key] then S.warned[key] = true log(msg) end
 end
 
+-- ================================================================ crash guard
+-- Some things the mod asks the game to do on the other player's behalf (give an item, kill or
+-- spawn an enemy, move an object) can crash the game outright, where no error handling helps.
+-- And because the other game keeps resending what was not acknowledged, the same request would
+-- crash every launch. So each such call first leaves a note of what it is about to do, and the
+-- note is removed a couple of seconds later. A note still there when the game starts means the
+-- game went down right after that. Once could be chance (the player quit at that moment), so
+-- the first time it is only remembered as a suspect; if the game goes down right after the same
+-- thing again, it is written to skip.txt and not carried out for the next three days.
+local risky, riskTick
+do
+local RISK_NOTE = DIR .. "\\doing.txt"
+local RISK_SUSPECT = DIR .. "\\suspect.txt"
+local RISK_SKIP = DIR .. "\\skip.txt"
+local RISK_DAYS = 3
+
+local function readAll(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = (f:read("a") or ""):gsub("%s+$", "")
+    f:close()
+    return s
+end
+
+if not S.riskChecked then
+    S.riskChecked = true
+    S.skip = {}
+    local f = io.open(RISK_SKIP, "r")
+    if f then
+        for line in f:lines() do
+            local what, when = line:match("^(.-)\t(%d+)$")
+            if what and os.time() - tonumber(when) < RISK_DAYS * 86400 then S.skip[what] = true end
+        end
+        f:close()
+    end
+    local what = readAll(RISK_NOTE)
+    if what then
+        os.remove(RISK_NOTE)
+        if #what > 0 and not S.skip[what] then
+            if readAll(RISK_SUSPECT) == what then
+                os.remove(RISK_SUSPECT)
+                S.skip[what] = true
+                local a = io.open(RISK_SKIP, "a")
+                if a then a:write(what, "\t", tostring(os.time()), "\n") a:close() end
+                log("the game went down twice right after '" .. what .. "'; that is skipped from now on")
+            else
+                local s = io.open(RISK_SUSPECT, "w")
+                if s then s:write(what) s:close() end
+                log("the game closed last time right after '" .. what .. "'; if that happens again it will be skipped")
+            end
+        end
+    end
+end
+
+-- Returns false when the request is one that took the game down before.
+risky = function(kind, key, fn)
+    local what = kind .. " " .. tostring(key)
+    if S.skip[what] then
+        warnOnce("skip:" .. what, "skipping '" .. what .. "': the game went down right after it, twice")
+        return false
+    end
+    local f = io.open(RISK_NOTE, "w")
+    if f then f:write(what) f:close() end
+    S.riskWhat, S.riskUntil = what, os.clock() + 2.5
+    pcall(fn)
+    return true
+end
+
+-- `leaving` is true once the player is gone (menu, loading, shutting down): whatever we did
+-- last did not crash the game, the world is being taken apart in an orderly way.
+riskTick = function(leaving)
+    if S.riskUntil and (leaving or os.clock() >= S.riskUntil) then
+        S.riskUntil = nil
+        os.remove(RISK_NOTE)
+        if not leaving and S.riskWhat and readAll(RISK_SUSPECT) == S.riskWhat then
+            os.remove(RISK_SUSPECT)   -- the suspect just ran and nothing happened: cleared
+        end
+    end
+end
+end   -- of the crash guard block
+
 -- ================================================================ settings
 -- <this mod>\config.txt, one key=value per line, written by the launcher. Re-read about once a
 -- second, so changes apply while the game runs.
@@ -88,6 +169,11 @@ local DEFAULTS = {
     sync_saves = "1",           -- the joiner saves when the host saves, and loads when the host loads
     other_player_collision = "0", -- the other player's body blocks me (and enemies)
     friendly_fire = "0",        -- my attacks hurt the other player (both must enable it)
+    unlimited_ammo = "0",       -- ammunition never runs out, for both players if either enables it
+    shared_death = "1",         -- when either player dies, both restart from the host's last save
+    sync_story = "1",           -- story triggers, switches and pickup events fire in both games
+    show_peer_pickups = "1",    -- the game's "item collected" popup for what the other player picks up
+    show_peer_shots = "1",      -- muzzle flash and gunshot sound at the other player when they fire
     ff_hit_damage = "10",       -- health lost per melee hit, my estimate of one enemy hit; a shot is double
     show_other_player = "1",    -- draw the other player at all
     other_player_scale = "100", -- their size on my screen, percent
@@ -168,11 +254,12 @@ local function readInventory(pawn)
     return m
 end
 
-local function applyItemDelta(pawn, name, delta)
+-- `markNew` puts the game's "new" mark on the item in the inventory, as for our own pickups.
+local function applyItemDelta(pawn, name, delta, markNew)
     if delta == 0 then return end
     local items = pawn.Items
     if delta > 0 then
-        items:CollectItem(FName(name), delta, false)
+        risky("give", name, function() items:CollectItem(FName(name), delta, markNew == true) end)
     else
         items:RemoveItem(FName(name), -delta, false)
     end
@@ -206,6 +293,64 @@ local function pollInventory(pawn)
     S.known = cur
 end
 
+-- Unlimited ammunition, when either player switches it on: about once a second every kind of
+-- ammunition is filled back up to a fixed amount. You still reload; the reserve just never runs
+-- dry. A kind can only be refilled once its name is known, so each kind starts being unlimited
+-- from the first time either player has held some of it (the names are kept between sessions).
+local AMMO = { floor = 60, file = DIR .. "\\ammo_names.txt" }
+
+local function ammoNames()
+    if S.ammoNames then return S.ammoNames end
+    S.ammoNames = {}
+    local f = io.open(AMMO.file, "r")
+    if f then
+        for line in f:lines() do if line:find("%S") then S.ammoNames[line] = true end end
+        f:close()
+    end
+    return S.ammoNames
+end
+
+local function rememberAmmo(name, sure)
+    local names = ammoNames()
+    if names[name] or name == "" or name == "None" or not (sure or name:lower():find("ammo")) then return end
+    names[name] = true
+    local f = io.open(AMMO.file, "a")
+    if f then f:write(name, "\n") f:close() end
+end
+
+local function unlimitedAmmoOn()
+    return on("unlimited_ammo") or (peer.unlimitedAt ~= nil and os.clock() - peer.unlimitedAt < 3)
+end
+
+local function ammoTick(pawn)
+    local cur = readInventory(pawn)
+    if not cur then return end
+    for name in pairs(cur) do rememberAmmo(name) end
+    -- every firearm names the ammunition it takes, so a gun in the world is enough to know its kind
+    pcall(function()
+        local guns = FindAllOf("SHItemWeaponRanged")
+        for i = 1, guns and #guns or 0 do
+            local g = guns[i]
+            if g:IsValid() then
+                pcall(function() rememberAmmo(g.WeaponAmmoItem.RowName:ToString(), true) end)
+            end
+        end
+    end)
+    if not unlimitedAmmoOn() then
+        if S.ammoWasOn then S.ammoWasOn = nil log("unlimited ammo off") end
+        return
+    end
+    if not S.ammoWasOn then S.ammoWasOn = true log("unlimited ammo on") end
+    for name in pairs(ammoNames()) do
+        local have = cur[name] or 0
+        if have < AMMO.floor then
+            applyItemDelta(pawn, name, AMMO.floor - have)
+            -- each game refills its own reserve, so this is not something to tell the other one
+            if S.known then S.known[name] = AMMO.floor end
+        end
+    end
+end
+
 local function sendFullInventory(pawn)
     local cur = readInventory(pawn)
     if not cur then return end
@@ -220,11 +365,21 @@ local function onRemoteInv(pawn, name, delta)
     if not itemShared(name) then return end
     -- Queue our own pending changes first so they are not swallowed by the merge.
     pollInventory(pawn)
-    applyItemDelta(pawn, name, delta)
+    -- What the other player picks up is shown here the way the game shows our own pickups: the
+    -- "new" mark on the item in the inventory, and the popup on the HUD. (Not for ammunition
+    -- while it is unlimited: that would be a popup for every refill.)
+    local announce = delta > 0 and on("show_peer_pickups") and not (unlimitedAmmoOn() and ammoNames()[name])
+    applyItemDelta(pawn, name, delta, announce)
     S.known = S.known or {}
     local v = (S.known[name] or 0) + delta
     S.known[name] = (v > 0) and v or nil
     log(string.format("inventory from peer: %s %+d", name, delta))
+    if announce then
+        risky("notify", name, function()
+            local ui = StaticFindObject("/Script/SHProto.Default__SHGameplayUIStatics")
+            ui:RequestItemNotification(pawn, FName(name), delta, 1)   -- 1 = "collected"
+        end)
+    end
 end
 
 local function onRemoteInvFull(pawn, list)
@@ -244,7 +399,8 @@ local function onRemoteInvFull(pawn, list)
 end
 
 local onRemoteLock, onRemoteFriendlyFire, onRemoteCutscene, onRemoteTook, onRemoteEnemyDamage, onRemoteSolved, onRemotePush   -- defined further down
-local onRemoteSaved, onRemoteLoaded, onRemoteEnemyDead
+local onRemoteSaved, onRemoteLoaded, onRemoteEnemyDead, onRemoteShot, onRemoteDied, onRemoteReaction
+local onRemoteTrigger, onRemoteUse
 
 local function handleEvent(pawn, text)
     local kind, rest = text:match("^(%S+)%s*(.*)$")
@@ -252,7 +408,22 @@ local function handleEvent(pawn, text)
         onRemoteSaved(pawn, tonumber(rest:match("^(%-?%d+)$")) or -1)
         return
     elseif kind == "loaded" then
-        onRemoteLoaded(pawn)
+        onRemoteLoaded(pawn, tonumber(rest:match("^(%d+)$")))
+        return
+    elseif kind == "died" then
+        onRemoteDied(pawn)
+        return
+    elseif kind == "ereact" then
+        local id, code = rest:match("^(%x+) (%d)$")
+        if id then onRemoteReaction(pawn, id, tonumber(code)) end
+        return
+    elseif kind == "trig" or kind == "trigx" then
+        local id = rest:match("^(%x+)$")
+        if id and on("sync_story") then onRemoteTrigger(id, kind == "trig") end
+        return
+    elseif kind == "use" then
+        local id = rest:match("^(%x+)$")
+        if id and on("sync_story") then onRemoteUse(id) end
         return
     elseif kind == "push" then
         local id, x, y, z = rest:match("^(%x+) (%-?%d+) (%-?%d+) (%-?%d+)$")
@@ -261,6 +432,9 @@ local function handleEvent(pawn, text)
     elseif kind == "solved" then
         local id = rest:match("^(%x+)$")
         if id and on("sync_puzzles") then onRemoteSolved(id) end
+        return
+    elseif kind == "shot" then
+        if on("show_peer_shots") then onRemoteShot(pawn, rest) end
         return
     elseif kind == "edead" then
         local id = rest:match("^(%x+)$")
@@ -456,10 +630,24 @@ local function clearHeld()
     S.heldApplied = nil
 end
 
+-- An asset already in memory is used at once. One that is not has to be read from disk, and
+-- that is a blocking load: done while the game is busy streaming a level in on its loading
+-- thread, it crashes the game (the cause of the load-time crashes in 0.16 to 0.18, when the
+-- other player was already there and their model or held item had to be read). So right after a
+-- load the answer is "later" and the caller tries again; afterwards loads are spaced out and go
+-- through the crash guard, so one asset that still crashes is given up on.
+local ASSET_SETTLE = 20   -- seconds after a load before anything is read from disk
+local ASSET_GAP = 3       -- seconds between two disk loads
+
 local function findAsset(path)
     local a = StaticFindObject(path)
     if a and a:IsValid() then return a end
-    pcall(LoadAsset, path)
+    local now = os.clock()
+    if now - (S.loadedAt or now) < ASSET_SETTLE or now - (S.lastAssetLoad or -100) < ASSET_GAP then
+        return nil, "later"
+    end
+    S.lastAssetLoad = now
+    if not risky("load", path, function() LoadAsset(path) end) then return nil end
     a = StaticFindObject(path)
     if a and a:IsValid() then return a end
     return nil
@@ -496,18 +684,23 @@ local function applyHeld(desc)
     clearHeld()
     S.heldApplied = desc
     if not (S.avatar and S.avatar:IsValid() and S.avatarComp and S.avatarComp:IsValid()) then return end
+    if desc == "" or not desc:find("%S") then log("avatar now holds 0 item(s)") return end
 
     local staticCls = StaticFindObject("/Script/Engine.StaticMeshComponent")
     local skelCls = StaticFindObject("/Script/Engine.SkeletalMeshComponent")
+    local later = false
     for entry in desc:gmatch("%S+") do
         local kind, path, socket, lx, ly, lz, rp, ry, rr =
             entry:match("^(%a)|([^|]+)|([^|]*)|([^,]+),([^,]+),([^|]+)|([^,]+),([^,]+),(.+)$")
-        local asset = kind and findAsset(path)
+        local asset, why
+        if kind then asset, why = findAsset(path) end
         local pawn = getPawn()
         local attachName, rel
         if asset and pawn then attachName, rel = attachPoint(pawn, S.avatarComp, socket) end
         if asset and not attachName then
             -- this body has nowhere comparable to put it: leave it out
+        elseif why == "later" then
+            later = true   -- not in memory and too early to read from disk; tried again below
         elseif not asset then
             warnOnce("held:" .. tostring(path), "cannot show held item, asset not available: " .. tostring(path))
         else
@@ -529,6 +722,10 @@ local function applyHeld(desc)
                 S.heldComps[#S.heldComps + 1] = comp
             end
         end
+    end
+    if later then
+        S.heldApplied = nil   -- so the next look at what they hold tries again
+        return
     end
     log("avatar now holds " .. #S.heldComps .. " item(s)")
 end
@@ -591,6 +788,7 @@ local function spawnAvatar(pawn)
     S.heldComps = {}
     S.heldApplied = nil
     S.lightComp = nil
+    S.muzzle, S.muzzleOffAt = nil, nil
     S.capsule = nil
     S.collisionOn = nil
     S.avatarScale = nil
@@ -643,10 +841,10 @@ local function manageSelf(pawn)
         if want and S.selfComp and S.selfComp:IsValid() and pawn.Mesh:IsVisible() then showRealBody(pawn, false) end
         return
     end
+    if not want then S.selfModel = want removeSelfBody(pawn) return end
+    local asset, why = findAsset(MODELS[want])
+    if why == "later" then return end   -- too early to read the model from disk; tried again next pass
     S.selfModel = want   -- also remembers a choice that failed, so it is not retried every tick
-
-    if not want then removeSelfBody(pawn) return end
-    local asset = findAsset(MODELS[want])
     if not asset then
         warnOnce("self-missing:" .. want, "model '" .. want .. "' could not be loaded for your own character")
         removeSelfBody(pawn)
@@ -696,7 +894,9 @@ local function applyModel(pawn)
     local comp = S.avatarComp
     if want == S.avatarModel or not (comp and comp:IsValid()) then return end
 
-    local asset = (want == "james") and meshAssetOf(pawn.Mesh) or findAsset(MODELS[want])
+    local asset, why
+    if want == "james" then asset = meshAssetOf(pawn.Mesh) else asset, why = findAsset(MODELS[want]) end
+    if why == "later" then return end   -- they stay James for a moment; tried again on the next pass
     if asset then
         comp:SetSkinnedAssetAndUpdate(asset, true)
         if comp:GetBoneIndex(BONES[1]) < 0 then
@@ -925,8 +1125,14 @@ end
 -- enemies walk into it, while doors, bullets and the camera pass through.
 local function updateCollision(pawn)
     local want = on("other_player_collision") and S.avatarVisible == true
+    -- Not while a load is settling, and not at all once it has been tied to a crash.
+    if want and (S.skip["step collision"] or os.clock() - (S.loadedAt or os.clock()) < 15) then
+        if S.skip["step collision"] then warnOnce("skip:collision", "collision with the other player stays off: it crashed the game before") end
+        want = false
+    end
     if want == S.collisionOn and (not want or (S.capsule and S.capsule:IsValid())) then return end
     if want then
+        risky("step", "collision", function() end)   -- leaves the note; the calls below are the risky part
         if not (S.capsule and S.capsule:IsValid()) then
             local cap = S.avatar:AddComponentByClass(StaticFindObject("/Script/Engine.CapsuleComponent"), true, IDENT, false)
             if not cap or not cap:IsValid() then warnOnce("capsule", "could not create the collision capsule") return end
@@ -971,6 +1177,22 @@ local SETTLE_SECONDS = 6     -- how long a freshly loaded door or pickup is left
 S.doorState = S.doorState or {}       -- id -> { lock = bool, lastTarget = angle }
 S.pendingLocks = S.pendingLocks or {} -- id -> bool, for doors not loaded here yet
 S.doors = S.doors or {}               -- currently loaded doors: { id, comp, lock, x, y, z }
+
+-- Fire a blueprint event dispatcher by hand: call every handler bound to it. (UE4SS's own
+-- Broadcast returned without reaching the handlers when the event carries arguments.)
+local function fireEvent(dispatcher, ...)
+    local args = { ... }
+    local bindings = dispatcher:GetBindings()
+    local n = 0
+    for i = 1, #bindings do
+        local obj, fn = bindings[i].Object, bindings[i].FunctionName:ToString()
+        if obj and obj:IsValid() then
+            pcall(function() obj[fn](obj, table.unpack(args)) end)
+            n = n + 1
+        end
+    end
+    return n
+end
 
 local function hashName(s)   -- djb2, 32 bit
     local h = 5381
@@ -1351,6 +1573,16 @@ local function itemsTick(pawn)
                 collected = true
                 S.itemState[id] = true
                 log("removed a pickup the other player already took")
+                -- Levels hang story on pickups ("when the coin is collected, ..."). Tell whatever
+                -- is listening here that this one has been collected, as the game itself would.
+                if on("sync_story") then
+                    local listeners = 0
+                    pcall(function() listeners = #item.OnCollected:GetBindings() end)
+                    if listeners > 0 then
+                        risky("collected", id, function() fireEvent(item.OnCollected, item) end)
+                        log("told " .. listeners .. " story listener(s) that the pickup was collected")
+                    end
+                end
             end
             local known = S.itemState[id]
             if known == nil then
@@ -1429,7 +1661,7 @@ local function pushablesTick(pawn)
             else
                 if st.mine then   -- we just let go
                     st.mine = nil
-                    if not S.mirror then
+                    if not S.mirror and not (loc.X == 0 and loc.Y == 0 and loc.Z == 0) then
                         enqueue(string.format("push %s %d %d %d", p.id, math.floor(loc.X), math.floor(loc.Y), math.floor(loc.Z)))
                     end
                     log("you moved an object" .. (S.mirror and "" or ", telling the other player"))
@@ -1437,8 +1669,16 @@ local function pushablesTick(pawn)
                 -- follow the other player's copy, once ours has settled after loading
                 local target = theirs[p.id] or S.pushRemote[p.id]
                 if target and now - (st.since or now) >= SETTLE_SECONDS then
-                    if dist3(target[1], target[2], target[3], loc.X, loc.Y, loc.Z) > 3 then
-                        pcall(function() p.comp:TeleportAbsolute({ X = target[1], Y = target[2], Z = target[3] }) end)
+                    -- A position of exactly 0,0,0 is not a place in the level: the other game could
+                    -- not read where its copy was. Never move anything there.
+                    local bogus = target[1] == 0 and target[2] == 0 and target[3] == 0
+                    local far = dist3(target[1], target[2], target[3], loc.X, loc.Y, loc.Z)
+                    if not bogus and far > 3 then
+                        if far > 100 then
+                            risky("move", p.id, function() p.comp:TeleportAbsolute({ X = target[1], Y = target[2], Z = target[3] }) end)
+                        else
+                            pcall(function() p.comp:TeleportAbsolute({ X = target[1], Y = target[2], Z = target[3] }) end)
+                        end
                     end
                     if S.pushRemote[p.id] and not theirs[p.id] then
                         S.pushRemote[p.id] = nil
@@ -1488,13 +1728,12 @@ end
 
 -- ================================================================ saving and loading together
 
--- Each PC keeps its own save files, and the game can only "reload the latest save" from code,
--- not load a chosen slot. So the two games are kept in step like this:
+-- Each PC keeps its own save files. The two games are kept in the same load like this:
 --   * When the host's game saves, the joiner's game saves at the same moment (into the same
---     slot number when the host used one). Both PCs then hold a save of the same point.
---   * When the host loads, or dies and reloads, the joiner reloads its own latest save, which
---     is that matching one, and is then placed beside the host.
--- Limit: if the host deliberately loads an older slot, the joiner still gets its latest save.
+--     slot number when the host used one), so the joiner's own files keep up with the story.
+--   * When the host loads a save, or the pair restarts after a death, the joiner does not load
+--     a file of its own. It goes back to the main menu and joins the host's game again, which
+--     copies the host's state over: see rejoinHost and "joining from the main menu".
 
 local SAVE_FUNCTIONS = { "MakeFullSave", "SaveGame", "MakeQuickSave", "AutoSave" }
 
@@ -1547,27 +1786,134 @@ onRemoteSaved = function(pawn, slot)
     log(ok and "saved here because the host saved" or ("could not save with the host: " .. tostring(err)))
 end
 
-onRemoteLoaded = function(pawn)
-    if not on("sync_saves") or S.role ~= "join" then return end
-    local now = os.clock()
-    if now - (S.lastReloadAt or -100) < 20 then return end   -- one reload per host load
-    S.lastReloadAt = now
-    log("the host loaded; loading here too")
-    local ok, err = pcall(function() UEHelpers.GetGameInstance():ReloadGame(false, "", false, nil, 0) end)
-    if not ok then log("could not load with the host: " .. tostring(err)) end
+-- The joiner gets back into the host's world the same way they first got in: through the main
+-- menu's "Join co-op" entry, which copies the host's save over and loads it. Here that is done
+-- for them: back to the main menu, and the menu code presses the entry by itself once the host
+-- is in the game (and, when the host is about to reload, only after it has).
+local function rejoinHost(why, minGen)
+    if S.autoJoin or S.role ~= "join" then return end
+    S.autoJoin = { since = os.clock(), minGen = minGen, tries = 0 }
+    log("going back to the main menu to rejoin the host (" .. why .. ")")
+    pcall(function() UEHelpers.GetGameInstance():BackToMainMenu() end)
+end
+
+-- The host counts its loads and says the number in every packet. A number other than the one
+-- we joined at means the host is in a different load than we are. (Other, not higher: the
+-- count starts again when the host restarts the game.)
+onRemoteLoaded = function(pawn, gen)
+    if not on("sync_saves") or S.role ~= "join" or S.restart then return end
+    if gen and S.joinedGen and gen == S.joinedGen then return end   -- that is the load we joined
+    rejoinHost("the host loaded a save", nil)
 end
 
 -- Called when our player is back after not existing for a while, i.e. a load just finished.
 local function onLoadedHere(pawn)
     local viaMenu = S.joinedViaMenu   -- we just loaded the host's save from the main menu
     S.joinedViaMenu = nil
+    S.loadGen = (S.loadGen or 1) + 1
     if S.role == "join" then
+        S.loadedOnOurOwn = not viaMenu or nil   -- a load that did not come from the host; see the tick
         if viaMenu or on("sync_saves") then
             S.regroupAfterLoad = os.clock() + 3  -- stand beside the host once they are visible
         end
     elseif on("sync_saves") and peer.connected and not S.mirror then
-        enqueue("loaded")
-        log("you loaded; the joiner's game will load too")
+        enqueue("loaded " .. S.loadGen)
+        log("you loaded; the joiner will load your save too")
+    end
+end
+
+-- ================================================================ a line of text on the HUD
+
+-- For the few things the mod has to say in game. A text block added to the game's own HUD, in
+-- the HUD's own font, centred in the upper part of the screen.
+local MESSAGES = {
+    peer_died = { "Other player died, restarting...", "Другой игрок погиб, перезапуск..." },
+    you_died = { "You died, both players restart...", "Ты погиб, оба игрока начинают заново..." },
+    host_loaded = { "The host loaded a save, joining...", "Хост загрузил сохранение, подключаемся..." },
+}
+
+local function hideMessage()
+    S.msgUntil = nil
+    local t = S.msgText
+    if t and t:IsValid() then pcall(function() t:SetVisibility(1) end) end   -- 1 = collapsed
+end
+
+local function showMessage(key, seconds)
+    local pair = MESSAGES[key]
+    if not pair then return end
+    local hud = FindFirstOf("SHGameplayHudWidget")
+    if not (hud and hud:IsValid()) then return end
+    local text = S.msgText
+    if not (text and text:IsValid() and S.msgHud == hud:GetAddress()) then
+        S.msgCount = (S.msgCount or 0) + 1
+        text = StaticConstructObject(StaticFindObject("/Script/UMG.TextBlock"), hud.WidgetTree, FName("CoopMessage" .. S.msgCount))
+        if not (text and text:IsValid()) then return end
+        pcall(function()
+            for _, tb in ipairs(FindAllOf("TextBlock") or {}) do
+                if tb:IsValid() and tb:GetFName():ToString() == "NotificationText_CurrentAmmo" then
+                    text:SetFont(tb.Font)
+                    break
+                end
+            end
+        end)
+        pcall(function() text:SetColorAndOpacity({ SpecifiedColor = { R = 0.92, G = 0.9, B = 0.86, A = 1 }, ColorUseRule = 0 }) end)
+        pcall(function()
+            text:SetShadowOffset({ X = 2, Y = 2 })
+            text:SetShadowColorAndOpacity({ R = 0, G = 0, B = 0, A = 0.85 })
+        end)
+        pcall(function() text:SetJustification(1) end)
+        local slot = hud.MainContainer:AddChild(text)
+        pcall(function()
+            slot:SetAnchors({ Minimum = { X = 0.5, Y = 0.24 }, Maximum = { X = 0.5, Y = 0.24 } })
+            slot:SetAlignment({ X = 0.5, Y = 0.5 })
+            slot:SetAutoSize(true)
+            slot:SetPosition({ X = 0, Y = 0 })
+            slot:SetZOrder(60)
+        end)
+        S.msgText, S.msgHud = text, hud:GetAddress()
+    end
+    pcall(function() text:SetText(FText(S.menuRussian and pair[2] or pair[1])) end)
+    pcall(function() text:SetVisibility(3) end)   -- 3 = shown, and never in the way of the mouse
+    S.msgUntil = os.clock() + (seconds or 4)
+end
+
+-- ================================================================ dying together
+
+-- One life for the pair: when either player dies, both restart. The one still standing is told
+-- why. The host reloads its last save; the joiner then joins that load like any other, so both
+-- are in exactly the same state again.
+
+onRemoteDied = function(pawn)
+    if not on("shared_death") or S.restart then return end
+    S.restart = { why = "peer", at = os.clock(), hostGen = peer.gen }
+    showMessage("peer_died", 8)
+    log("the other player died; both players restart")
+end
+
+local function deathTick(pawn)
+    if S.deathSeen then return end
+    local dead = false
+    pcall(function() dead = tonumber(pawn.Health:GetHealthState()) == 4 end)   -- 4 = death
+    if not dead then return end
+    S.deathSeen = true
+    if not (on("shared_death") and peer.connected and not S.mirror) then return end
+    enqueue("died")
+    if not S.restart then S.restart = { why = "self", at = os.clock(), hostGen = peer.gen } end
+    log("you died; both players restart")
+end
+
+local function restartTick(pawn)
+    local r = S.restart
+    if not r then return end
+    -- our own death is left a little longer, so its last moments are not cut off
+    if os.clock() - r.at < (r.why == "self" and 5.0 or 3.0) then return end
+    S.restart = nil
+    hideMessage()
+    if S.role == "join" then
+        rejoinHost(r.why == "self" and "you died" or "the host died", (r.hostGen or 0) + 1)
+    else
+        log("restarting from the last save")
+        risky("reload", "last save", function() UEHelpers.GetGameInstance():ReloadGame(false, "", false, nil, 0) end)
     end
 end
 
@@ -1678,19 +2024,75 @@ local function scanEnemies()
     S.spawnerById = byId
 end
 
--- An enemy died in the other game: it dies here too. The health component's own calls mark it
--- dead and switch its collision off, but on their own they can leave the body standing, so a
--- moment later a body that is not playing its death is simply taken out of sight.
+-- Health and what an enemy visibly does are two systems in this game. Health is a number on a
+-- component. Staggering, falling and dying are "hit reactions", chosen and played by a separate
+-- subcomponent when a blow lands. Changing the number alone (which is all the mod did before
+-- 0.20) leaves the body standing: hurt without flinching, or dead on its feet. So the reaction
+-- is carried across as well, and played here through the same call the game itself makes.
+local REACT_DEATH = 6
+
+-- What the enemy is doing right now, as the game's own reaction type; 0 when nothing.
+local function reactionOf(actor)
+    local code = 0
+    pcall(function()
+        local an = actor.AnimComponent
+        if an:IsInDeathState(false) then code = 6
+        elseif an:IsInKnockdownState(false) then code = 5
+        elseif an:IsInFalterState(false) then code = 4
+        elseif an:IsInStaggerState(false) then code = 3
+        elseif an:IsInNormalHitState(false) then code = 2
+        end
+    end)
+    return code
+end
+
+-- Where the blow came from, for the other player's hits: where their body stands here.
+local function attackerSpot(pawn)
+    local a = (S.avatar and S.avatar:IsValid() and S.avatarVisible) and S.avatar or pawn
+    local l = a:K2_GetActorLocation()
+    return { X = l.X, Y = l.Y, Z = l.Z + 100 }
+end
+
+local function playReaction(pawn, e, code)
+    local sub
+    pcall(function()
+        sub = e.actor.AnimComponent:FindSubcomponentByClass(StaticFindObject("/Script/SHProto.SHHitReactionSubcomponent"))
+    end)
+    if not (sub and sub:IsValid()) then return false end
+    local damageType = StaticFindObject("/Script/SHProto.Default__SHMeleeBaseDamage")
+    local from = attackerSpot(pawn)
+    -- our own player is named as the one who did it: a real character, as the game expects
+    return risky("react", tostring(code), function()
+        sub:ChooseAndApplyHitReaction({}, damageType, code, FName("None"), 0.0, 100.0, 0, from, pawn, {})
+    end)
+end
+
+-- An enemy died in the other game: it dies here too, visibly. First its death reaction, then
+-- its health. A body that still is not lying in its death a moment later is taken out of sight.
 local function killHere(pawn, e, st)
-    local from = (S.avatar and S.avatar:IsValid()) and S.avatar or pawn
-    pcall(function() e.health:ReceiveDamage(e.health:GetHealth() + 1, from) end)
-    local dead = false
-    pcall(function() dead = e.health:IsDead() end)
-    if not dead then pcall(function() e.health:Kill() end) end
+    playReaction(pawn, e, REACT_DEATH)
+    risky("kill", e.id, function() e.health:Kill() end)
     pcall(function() st.hp = e.health:GetHealth() end)
     st.forced = nil
-    st.tidyAt = os.clock() + 1.5
-    log("an enemy the other player killed died here too")
+    st.react, st.reactQuiet = REACT_DEATH, os.clock() + 3
+    st.tidyAt = os.clock() + 2.5
+end
+
+-- The other player's hit made their copy stagger, falter or go down: ours does the same.
+onRemoteReaction = function(pawn, id, code)
+    if not on("sync_enemies") or code < 2 or code > 5 then return end
+    local e
+    for _, x in ipairs(S.enemies) do
+        if x.id == id and x.actor:IsValid() then e = x end
+    end
+    if not e then return end
+    local st = S.enemyState[id]
+    if not st then st = {} S.enemyState[id] = st end
+    local alive = false
+    pcall(function() alive = e.health:GetHealth() > 0 and not e.health:IsDead() end)
+    if not alive or reactionOf(e.actor) >= code then return end   -- dead, or already doing as much
+    st.react, st.reactQuiet = code, os.clock() + 1.5              -- so it is not reported back as ours
+    playReaction(pawn, e, code)
 end
 
 local function tidyBody(e, st)
@@ -1706,19 +2108,25 @@ end
 
 -- The other game has a live enemy that does not exist here (a scene spawned it there, or only
 -- that player walked into its area): have its spawner make it here as well.
+-- Kept narrow on purpose: only spawners the game itself fires from a script (the ones that spawn
+-- by area do so on their own once a player is near), one at a time, and never while a load is
+-- still settling.
 local function spawnMissing(theirs, known)
     local now = os.clock()
+    if now - (S.lastSpawnAt or -100) < 3 then return end
     for id, t in pairs(theirs) do
-        if t.hp > 0 and not known[id] and not S.enemyDead[id] and now - (S.spawnTried[id] or -100) > 10 then
+        if t.hp > 0 and not known[id] and not S.enemyDead[id] and now - (S.spawnTried[id] or -100) > 20 then
             local sp = S.spawnerById[id]
             if sp and sp:IsValid() then
                 local fresh = false
-                pcall(function() fresh = sp._Spawned == 0 and sp._Enabled == true end)
+                pcall(function() fresh = sp._Spawned == 0 and sp._Enabled == true and sp._AutoSpawn == false and sp:IsActive() end)
                 if fresh then
                     S.spawnTried[id] = now
-                    local ok = pcall(function() sp:Spawn() end)
-                    log(ok and "spawned an enemy that only the other player had" or "could not spawn an enemy the other player has")
+                    S.lastSpawnAt = now
+                    log("spawning an enemy that only the other player has")
+                    risky("spawn", id, function() sp:Spawn() end)
                     S.enemiesDue = true   -- look for its actor on the next pass
+                    return
                 end
             end
         end
@@ -1757,8 +2165,14 @@ onRemoteEnemyDamage = function(pawn, id, amount)
     if not e then return end      -- not loaded here; the host's health value catches it up later
     local st = S.enemyState[id]
     if not st then st = {} S.enemyState[id] = st end
-    local from = (S.avatar and S.avatar:IsValid()) and S.avatar or pawn
-    pcall(function() e.health:ReceiveDamage(amount, from) end)
+    -- Never lethal from here, and credited to our own player, who is a real character: a death
+    -- caused "by" the other player's stand-in body is a suspect in the 0.17 crashes. Deaths
+    -- arrive separately and go through killHere.
+    local hp = e.health:GetHealth()
+    if amount >= hp then amount = hp - 1 end
+    if amount >= 1 then
+        risky("hit", id, function() e.health:ReceiveDamage(amount, pawn) end)
+    end
     st.hp = e.health:GetHealth()   -- so we do not report this drop back as our own
 end
 
@@ -1780,6 +2194,9 @@ local function enemiesTick(pawn)
     local theirs = peer.enemies or {}
     local hunted = peer.hunted or {}
     local mineOut, deadOut, huntedOut, known = {}, {}, {}, {}
+    -- Nothing is killed or spawned for the other player while a load is still settling: the game
+    -- is busy restoring its own enemies then.
+    local settled = not S.mirror and os.clock() - (S.loadedAt or os.clock()) > 15
 
     for _, e in ipairs(S.enemies) do
         local actor = e.actor
@@ -1794,11 +2211,12 @@ local function enemiesTick(pawn)
 
             -- Dead in the other game means dead here, wherever it is. (Their packets list the
             -- dead ones near them, and every death is also sent once as a reliable event.)
-            if hp > 0 and not S.mirror and (S.enemyDead[e.id] or (theirCopy and theirCopy.hp <= 0)) then
+            if hp > 0 and settled and (S.enemyDead[e.id] or (theirCopy and theirCopy.hp <= 0)) then
                 if not st then st = {} S.enemyState[e.id] = st end
                 S.enemyDead[e.id] = true
                 if os.clock() - (st.killTried or -100) > 5 then   -- an enemy that cannot die yet is retried, not hammered
                     st.killTried = os.clock()
+                    log("an enemy the other player killed dies here too")   -- logged first, so a crash here names itself
                     killHere(pawn, e, st)
                     hp = e.health:GetHealth()
                 end
@@ -1819,6 +2237,30 @@ local function enemiesTick(pawn)
                 st.hp = hp
 
                 local alive = hp > 0
+                if alive then
+                    -- A reaction that started here (our own hit made it stagger or fall) is
+                    -- told to the other game, once, so their copy does the same.
+                    local code = reactionOf(actor)
+                    if code ~= (st.react or 0) then
+                        local quiet = st.reactQuiet and os.clock() < st.reactQuiet
+                        if code >= 2 and code <= 5 and code > (st.react or 0) and not quiet and not S.mirror then
+                            enqueue(string.format("ereact %s %d", e.id, code))
+                        end
+                        st.react = code
+                    end
+                elseif settled and os.clock() - (st.stuckCheck or -100) > 5 and not st.tidyAt then
+                    -- Dead, but neither lying in its death nor hidden: it was killed without being
+                    -- allowed to fall (by a version before 0.20, or a hiccup). Let it fall now.
+                    st.stuckCheck = os.clock()
+                    local dying, hidden = true, true
+                    pcall(function() dying = actor.AnimComponent:IsInDeathState(true) end)
+                    pcall(function() hidden = actor.bHidden end)
+                    if not dying and not hidden then
+                        log("an enemy was dead on its feet; letting it fall")
+                        playReaction(pawn, e, REACT_DEATH)
+                        st.tidyAt = os.clock() + 2.5
+                    end
+                end
                 local huntsMe = false
                 if alive then
                     pcall(function()
@@ -1877,7 +2319,7 @@ local function enemiesTick(pawn)
         if #mineOut >= ENEMY_MAX + 4 then break end
         mineOut[#mineOut + 1] = deadOut[i]
     end
-    if not S.mirror then spawnMissing(theirs, known) end
+    if settled then spawnMissing(theirs, known) end
     S.myEnemies = (#mineOut > 0) and table.concat(mineOut, " ") or nil
     S.myHunted = (#huntedOut > 0) and table.concat(huntedOut, " ") or nil
 end
@@ -1885,6 +2327,323 @@ end
 onRemoteEnemyDead = function(id)
     if not on("sync_enemies") then return end
     S.enemyDead[id] = true   -- the next enemy pass kills our copy, now or whenever it shows up
+end
+
+-- ================================================================ story triggers and things you use
+
+-- The story is driven by blueprint "trigger" boxes placed in the levels (walk in and something
+-- happens: a cutscene, enemies appear, a door slams, a sound plays), by one-shot event boxes,
+-- and by simple "press to use" objects: switches, drawers, cupboard doors, story hotspots. Each
+-- game only notices its own player. So when our player sets one off, the other game is told,
+-- and makes its copy of the object react as if its own player had done it, by calling the very
+-- handler the object runs for a real player. Whatever the level has wired to it follows.
+-- (In a block of its own: Lua allows a file only 200 top-level locals.)
+local onLocalTrigger, onLocalUse, tryInstallStoryHooks, storyTick
+do
+local TRIGGER_ENTER ="BndEvt__Box_K2Node_ComponentBoundEvent_0_ComponentBeginOverlapSignature__DelegateSignature"
+local TRIGGER_LEAVE = "BndEvt__Box_K2Node_ComponentBoundEvent_1_ComponentEndOverlapSignature__DelegateSignature"
+local TRIGGER_CLASSES = {
+    "/Game/Game/Gameplay/Triggers/TriggerBase_BP.TriggerBase_BP_C",
+    "/Game/WWise/Blueprints/OneShot/OneShotEventController_BP.OneShotEventController_BP_C",
+}
+local TRIGGER_FAMILIES = { "TriggerBase_BP_C", "OneShotEventController_BP_C" }
+-- Triggers about where *this* player is (what to stream in, where to crouch, what the map
+-- shows, when enemies give up) are each game's own business and are left alone.
+local TRIGGER_PRIVATE = { "Streaming", "PlayerExit", "EnableVolumes", "Cover", "NarrowPassage", "MapObject", "Activity", "ResetAggro", "Music" }
+
+local USE_CLASS = "/Game/Game/Gameplay/Interactions/GenericBase_BP.GenericBase_BP_C"
+local USE_EVENT = "BndEvt__Generic_A_K2Node_ComponentBoundEvent_0_GrabbedByCharacterBP__DelegateSignature"
+-- Of the many things built on the game's "press to use" base, only the ones that simply change
+-- the world are shared. Puzzles and readables zoom the camera in on the one who uses them, so
+-- those stay with that player (solved puzzles are shared separately).
+local USE_SHARED = { "Switch", "InteractiveDrawer", "InteractiveDoor", "InteractiveKitchenDrawer", "FurnitureSet" }
+
+S.trigQueue = S.trigQueue or {}       -- what our own player just set off: { object, entering }
+S.trigPending = S.trigPending or {}   -- id -> { at, steps }, from the other player, waiting for the object
+S.trigSent = S.trigSent or {}
+S.trigInside = S.trigInside or {}     -- id -> true while our own player stands in that trigger
+S.useQueue = S.useQueue or {}
+S.usePending = S.usePending or {}
+
+local function objectId(a)
+    return hashName(a:GetFullName():match("^%S+%s+(.+)$") or "")
+end
+
+local function nameHasAny(name, words)
+    for _, w in ipairs(words) do
+        if name:find(w, 1, true) then return true end
+    end
+    return false
+end
+
+-- Called from the hooks, in the middle of the game's own work: only take a note.
+onLocalTrigger = function(trigger, other, entering)
+    if S.trigApplying or S.mirror then return end
+    if not (trigger and trigger:IsValid() and other and other:IsValid()) then return end
+    if other:GetAddress() ~= S.pawnAddr then return end
+    S.trigQueue[#S.trigQueue + 1] = { trigger, entering }
+end
+
+onLocalUse = function(object, character)
+    if S.useApplying or S.mirror then return end
+    if not (object and object:IsValid() and character and character:IsValid()) then return end
+    if character:GetAddress() ~= S.pawnAddr then return end
+    S.useQueue[#S.useQueue + 1] = object
+end
+
+tryInstallStoryHooks = function()
+    if S.storyHooks then return end
+    local now = os.clock()
+    if now - (S.storyHookTry or -100) < 5 then return end   -- the blueprints load with the level; try again later
+    S.storyHookTry = now
+    S.storyHookDone = S.storyHookDone or {}
+    local waiting = 0
+    local function hook(path, callback)
+        if S.storyHookDone[path] ~= nil then return end
+        if pcall(RegisterHook, path, callback) then
+            S.storyHookDone[path] = true
+        elseif StaticFindObject(path:match("^(.-):")) ~= nil and StaticFindObject(path:match("^(.-):")):IsValid() then
+            S.storyHookDone[path] = false   -- the class is loaded and simply has no such handler
+        else
+            waiting = waiting + 1
+        end
+    end
+    for _, cls in ipairs(TRIGGER_CLASSES) do
+        hook(cls .. ":" .. TRIGGER_ENTER, function(self, comp, other)
+            local impl = SH2CoopMod.impl
+            if impl and impl.onTrigger then pcall(impl.onTrigger, self:get(), other:get(), true) end
+        end)
+        hook(cls .. ":" .. TRIGGER_LEAVE, function(self, comp, other)
+            local impl = SH2CoopMod.impl
+            if impl and impl.onTrigger then pcall(impl.onTrigger, self:get(), other:get(), false) end
+        end)
+    end
+    hook(USE_CLASS .. ":" .. USE_EVENT, function(self, generic, character)
+        local impl = SH2CoopMod.impl
+        if impl and impl.onUse then pcall(impl.onUse, self:get(), character:get()) end
+    end)
+    if waiting == 0 then
+        S.storyHooks = true
+        local n = 0
+        for _, ok in pairs(S.storyHookDone) do if ok then n = n + 1 end end
+        log("story hooks installed (" .. n .. ")")
+    end
+end
+
+onRemoteTrigger = function(id, entering)
+    local p = S.trigPending[id]
+    if not p then p = { at = os.clock(), steps = {} } S.trigPending[id] = p end
+    p.steps[#p.steps + 1] = entering
+    S.storyScanAt = nil   -- look for the object on the next pass
+end
+
+onRemoteUse = function(id)
+    S.usePending[id] = { at = os.clock() }
+    S.storyScanAt = nil
+end
+
+local function applyTrigger(pawn, t, id, entering)
+    if not entering and S.trigInside[id] then return end   -- we are standing in it ourselves
+    S.trigApplying = true
+    local ran = risky("trigger", id, function()
+        if entering then
+            t[TRIGGER_ENTER](t, t.Box, pawn, pawn.CapsuleComponent, 0, false, {})
+        else
+            t[TRIGGER_LEAVE](t, t.Box, pawn, pawn.CapsuleComponent, 0)
+        end
+    end)
+    S.trigApplying = false
+    if ran and entering then
+        log("a story trigger the other player set off fired here too (" .. t:GetClass():GetFName():ToString() .. ")")
+    end
+end
+
+local function applyUse(pawn, a, id)
+    local done = false
+    pcall(function() done = a.bUsed == true end)                    -- a switch already thrown
+    if not done then pcall(function() done = a.WasOpened == true end) end   -- a drawer already open
+    if done then return end
+    S.useApplying = true
+    local ran = risky("use", id, function()
+        local g = a.Generic_A
+        fireEvent(g.OnGrabbedByCharacterBP, g, pawn)
+    end)
+    S.useApplying = false
+    if ran then log("something the other player used was used here too (" .. a:GetClass():GetFName():ToString() .. ")") end
+end
+
+-- ~10x a second.
+storyTick = function(pawn)
+    local now = os.clock()
+    local settled = now - (S.loadedAt or now) > SETTLE_SECONDS
+    local together = peer.connected and not S.mirror
+
+    -- what our own player set off since the last pass
+    if #S.trigQueue > 0 then
+        local q = S.trigQueue
+        S.trigQueue = {}
+        for _, item in ipairs(q) do
+            local t, entering = item[1], item[2]
+            if t:IsValid() then
+                local id = objectId(t)
+                S.trigInside[id] = entering or nil
+                if settled and together and not nameHasAny(t:GetClass():GetFName():ToString(), TRIGGER_PRIVATE) then
+                    local key = id .. (entering and "+" or "-")
+                    if now - (S.trigSent[key] or -100) > 1.0 then
+                        S.trigSent[key] = now
+                        enqueue((entering and "trig " or "trigx ") .. id)
+                    end
+                end
+            end
+        end
+    end
+    if #S.useQueue > 0 then
+        local q = S.useQueue
+        S.useQueue = {}
+        for _, a in ipairs(q) do
+            if a:IsValid() and settled and together then
+                local cls = a:GetClass():GetFName():ToString()
+                if cls == "GenericBase_BP_C" or nameHasAny(cls, USE_SHARED) then
+                    enqueue("use " .. objectId(a))
+                    log("you used something, telling the other player (" .. cls .. ")")
+                end
+            end
+        end
+    end
+
+    -- what the other player set off, once its object is loaded here
+    if settled and (next(S.trigPending) or next(S.usePending)) and now - (S.storyScanAt or -100) > 1.0 then
+        S.storyScanAt = now
+        if next(S.trigPending) then
+            local byId = {}
+            for _, family in ipairs(TRIGGER_FAMILIES) do
+                for _, t in ipairs(FindAllOf(family) or {}) do
+                    if t:IsValid() then byId[objectId(t)] = t end
+                end
+            end
+            for id, p in pairs(S.trigPending) do
+                local t = byId[id]
+                if t then
+                    S.trigPending[id] = nil
+                    for _, entering in ipairs(p.steps) do applyTrigger(pawn, t, id, entering) end
+                elseif now - p.at > 180 then
+                    S.trigPending[id] = nil   -- never came into view here; we will set it off ourselves when we get there
+                end
+            end
+        end
+        if next(S.usePending) then
+            local byId = {}
+            for _, a in ipairs(FindAllOf("GenericBase_BP_C") or {}) do
+                if a:IsValid() then byId[objectId(a)] = a end
+            end
+            for id, p in pairs(S.usePending) do
+                local a = byId[id]
+                if a then
+                    S.usePending[id] = nil
+                    applyUse(pawn, a, id)
+                elseif now - p.at > 180 then
+                    S.usePending[id] = nil
+                end
+            end
+        end
+    end
+end
+end   -- of the story block
+
+-- ================================================================ gunshots
+
+-- The other player's body copies their pose, so it aims and recoils, but a pose carries no
+-- muzzle flash and no sound. So every shot is sent as an event, and the other game answers with
+-- a short flash of light at the body's gun hand and the weapon's own gunshot sound played from
+-- that spot.
+
+local function onLocalShot(weapon)
+    if S.mirror or not peer.connected then return end
+    local now = os.clock()
+    if now - (S.lastShotSent or -1) < 0.08 then return end   -- a shotgun reports one shot twice
+    S.lastShotSent = now
+    -- name the gunshot sound itself, so the other game does not need this gun in hand to play it
+    local sound = "gun"
+    pcall(function()
+        local ev = weapon.WeaponItemAudioComponent.ShootAudioEvent
+        local path = ev:GetFullName():match("^%S+%s+(%S+)$")
+        if path then sound = path end
+    end)
+    enqueue("shot " .. sound)
+end
+
+local function tryInstallShotHook()
+    if S.shotHook ~= nil then return end
+    local any = false
+    for _, fn in ipairs({ "OnFirePerformed", "OnFireSpreadPerformed" }) do
+        local ok = pcall(RegisterHook, "/Script/SHProto.SHItemWeaponRanged:" .. fn, function(self)
+            local impl = SH2CoopMod.impl
+            if impl and impl.onShot then pcall(impl.onShot, self:get()) end
+        end)
+        any = any or ok
+    end
+    S.shotHook = any
+    log(any and "shot hook installed" or "shot hook could not be installed; the other player will not see your shots")
+end
+
+local function muzzleFlash(loc)
+    if not (S.muzzle and S.muzzle:IsValid()) then
+        local light = S.avatar:AddComponentByClass(StaticFindObject("/Script/Engine.PointLightComponent"), true, IDENT, false)
+        if not (light and light:IsValid()) then return end
+        light:SetMobility(2)
+        pcall(function() light:K2_AttachToComponent(S.avatarComp, FName("None"), 2, 2, 2, false) end)
+        pcall(function() light:SetIntensityUnits(0) end)             -- unitless, like the game's own lights
+        pcall(function() light.bUseInverseSquaredFalloff = false end)
+        pcall(function() light:SetLightFalloffExponent(4.01) end)    -- the nudge makes the setter take effect
+        pcall(function() light:SetLightFalloffExponent(4) end)
+        pcall(function() light:SetAttenuationRadius(700) end)
+        pcall(function() light:SetLightColor({ R = 1.0, G = 0.78, B = 0.5, A = 1.0 }, true) end)
+        pcall(function() light:SetCastShadows(false) end)
+        light:SetIntensity(0)
+        S.muzzle = light
+    end
+    pcall(function() S.muzzle:K2_SetWorldLocation(loc, false, {}, true) end)
+    S.muzzle:SetIntensity(45)
+    S.muzzleOffAt = os.clock() + 0.07
+end
+
+onRemoteShot = function(pawn, className)
+    if not (S.avatar and S.avatar:IsValid() and S.avatarComp and S.avatarComp:IsValid()) then return end
+    local loc
+    pcall(function()
+        local l = S.avatarComp:GetSocketLocation(FName("hand_r"))
+        if l.X ~= 0 or l.Y ~= 0 or l.Z ~= 0 then loc = { X = l.X, Y = l.Y, Z = l.Z } end
+    end)
+    if not loc then
+        local a = S.avatar:K2_GetActorLocation()
+        loc = { X = a.X, Y = a.Y, Z = a.Z + 120 }
+    end
+
+    -- The message names the gunshot sound (an asset path). It is normally in memory already;
+    -- if not, any firearm we have out lends its shot, which is better than silence.
+    local event
+    if className:sub(1, 1) == "/" then event = findAsset(className) end
+    if not event then
+        local guns = FindAllOf("SHItemWeaponRanged")
+        for i = 1, guns and #guns or 0 do
+            local g = guns[i]
+            if g:IsValid() and not event then
+                pcall(function()
+                    local ev = g.WeaponItemAudioComponent.ShootAudioEvent
+                    if ev and ev:IsValid() then event = ev end
+                end)
+            end
+        end
+    end
+    if event then
+        pcall(function()
+            local ak = StaticFindObject("/Script/AkAudio.Default__AkGameplayStatics")
+            ak:PostEventAtLocation(event, loc, { Pitch = 0, Yaw = 0, Roll = 0 }, "", pawn)
+        end)
+    else
+        warnOnce("shot-sound", "no firearm loaded here to take the gunshot sound from")
+    end
+    pcall(muzzleFlash, loc)
 end
 
 -- ================================================================ friendly fire
@@ -2042,7 +2801,9 @@ local function writeOut(pawn)
     if S.myHeld then lines[#lines + 1] = "H " .. S.myHeld end
     if S.myDoors and on("sync_doors") then lines[#lines + 1] = "D " .. S.myDoors end
     lines[#lines + 1] = "C " .. (S.cutPlaying or "0")
+    if S.role ~= "join" then lines[#lines + 1] = "G " .. (S.loadGen or 1) end   -- which load the host is in
     if S.myPushing and on("sync_pushables") then lines[#lines + 1] = "U " .. S.myPushing end
+    if on("unlimited_ammo") then lines[#lines + 1] = "O ua" end   -- options that hold for both players
     if on("sync_enemies") then
         if S.myEnemies then lines[#lines + 1] = "N " .. S.myEnemies end   -- host: where its enemies are
         if S.myHunted then lines[#lines + 1] = "T " .. S.myHunted end     -- joiner: which ones hunt it
@@ -2162,6 +2923,10 @@ local function readIn(pawn)
             for id, x, y, z, hp, target in line:gmatch("(%x+):(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+):(%a)") do
                 enemiesSeen[id] = { x = tonumber(x), y = tonumber(y), z = tonumber(z), hp = tonumber(hp), target = target }
             end
+        elseif line:sub(1, 2) == "G " and not loopback then
+            peer.gen = tonumber(line:match("^G (%d+)")) or peer.gen
+        elseif line:sub(1, 2) == "O " then
+            if line:find(" ua", 1, true) then peer.unlimitedAt = os.clock() end
         elseif line:sub(1, 2) == "T " and not loopback then
             for id in line:sub(3):gmatch("%x+") do huntedSeen[id] = true end
         elseif line:sub(1, 2) == "C " and not loopback then
@@ -2245,6 +3010,7 @@ local MENU_LABELS = {
     join = { "Join co-op", "Совместная игра" },
     wait = { "Join co-op (waiting for host)", "Совместная игра (ждём хоста)" },
     busy = { "Joining...", "Подключение..." },
+    auto = { "Rejoining the host...", "Возвращаемся к хосту..." },
     fail = { "Could not join, try again", "Не получилось, попробуй ещё раз" },
 }
 
@@ -2378,14 +3144,18 @@ local function menuTick()
     -- Is the host in the game? Their game only sends while they are, so fresh packets mean yes.
     local f = io.open(IN_FILE, "r")
     if f then
-        local seq = (f:read("l") or ""):match("^S %x+ (%d+)")
+        local all = f:read("a") or ""
         f:close()
+        local seq = all:match("^S %x+ (%d+)")
         if seq and seq ~= S.menuHostSeq then
             if S.menuHostSeq ~= nil then S.menuHostTime = now end   -- the first look only sets the baseline
             S.menuHostSeq = seq
+            local gen = tonumber(all:match("\nG (%d+)"))            -- which load the host is in
+            if gen and gen ~= S.menuHostGen then S.menuHostGen, S.menuHostGenAt = gen, now end
         end
     end
     local hostInGame = S.menuHostTime ~= nil and now - S.menuHostTime < 3
+    local auto = S.autoJoin   -- set when the mod itself sent us here to rejoin the host
 
     if S.join then
         -- waiting for our launcher to fetch the host's save
@@ -2398,20 +3168,40 @@ local function menuTick()
             log("host's save received; loading it")
             setMenuButton("busy", false)
             S.joinedViaMenu = true
+            S.joinedGen = S.menuHostGen   -- the host load we are joining; a higher number later means rejoin
+            S.autoJoin = nil
             pcall(function() S.menu:LoadSavedGame(tonumber(slot), nil, 0) end)
             return
         elseif answer or now - S.join > 40 then
             S.join = nil
             S.joinFailedUntil = now + 4
             log("could not get the host's save: " .. (answer and (answer:match("^err%s+(.-)%s*$") or answer) or "no answer from the launcher"))
+            if auto then
+                auto.tries = (auto.tries or 0) + 1
+                if auto.tries >= 4 then
+                    S.autoJoin, auto = nil, nil
+                    log("rejoining the host failed four times; use the Join co-op entry when ready")
+                end
+            end
         else
             setMenuButton("busy", false)
             return
         end
     end
 
+    -- Rejoining by itself: wait until the host is in the game, in the load we are meant to join
+    -- (when the host was about to reload, that is the next one), and has been for a few seconds.
+    local autoReady = false
+    if auto and hostInGame then
+        local rightLoad = auto.minGen == nil or (S.menuHostGen ~= nil and S.menuHostGen >= auto.minGen) or now - auto.since > 60
+        local hostSettled = S.menuHostGenAt == nil or now - S.menuHostGenAt > 4
+        autoReady = rightLoad and hostSettled and now - (auto.lastTry or -100) > 6
+    end
+
     if S.joinFailedUntil and now < S.joinFailedUntil then
         setMenuButton("fail", false)
+    elseif auto and not autoReady then
+        setMenuButton("auto", false)
     elseif hostInGame then
         setMenuButton("join", true)
     else
@@ -2423,6 +3213,11 @@ local function menuTick()
     if not S.menuClickWired then pcall(function() pressed = S.menuBtn:IsPressed() end) end
     local clicked = S.menuClicked or (pressed and not S.menuPressed)
     S.menuClicked = nil
+    if autoReady and S.menuEnabled then
+        auto.lastTry = now
+        clicked = true
+        log("rejoining the host")
+    end
     if clicked and S.menuEnabled then
         os.remove(READY_FILE)
         local q = io.open(REQUEST_FILE, "w")
@@ -2445,6 +3240,11 @@ end
 -- ~30x a second, called by main.lua: measure ourselves and exchange messages.
 local function tick()
     pcall(runCmd)
+    pcall(riskTick)
+    if S.restart then   -- runs with or without a player: after a death there may be none for a while
+        local ok, err = pcall(restartTick)
+        if not ok then warnOnce("restart:" .. tostring(err), "restart error: " .. tostring(err)) end
+    end
 
     local pawn = getPawn()
     if not pawn then
@@ -2457,6 +3257,9 @@ local function tick()
         S.enemies, S.enemyState, S.enemyDead, S.spawnerById, S.spawnTried = {}, {}, {}, {}, {}
         S.puzzleState, S.solvedRemote, S.puzzleSeen, S.puzzleSince = {}, {}, nil, nil
         S.pushables, S.pushState, S.pushRemote, S.pushSeen = {}, {}, {}, nil
+        S.deathSeen, S.msgText, S.msgUntil = nil, nil, nil
+        S.trigQueue, S.trigPending, S.trigSent, S.trigInside, S.useQueue, S.usePending = {}, {}, {}, {}, {}, {}
+        pcall(riskTick, true)
         S.pawnGone = true   -- menu, loading screen or death: the next time we exist, a load has finished
         local okMenu, errMenu = pcall(menuTick)
         if not okMenu then warnOnce("menu:" .. tostring(errMenu), "main menu error: " .. tostring(errMenu)) end
@@ -2468,6 +3271,9 @@ local function tick()
     if not whole then return end
     S.tickCount = S.tickCount + 1
 
+    if S.pawnGone or not S.loadedAt then
+        S.loadedAt = os.clock()
+    end
     if S.pawnGone then
         S.pawnGone = nil
         local ok, err = pcall(onLoadedHere, pawn)
@@ -2484,6 +3290,32 @@ local function tick()
         end
     end
 
+    S.pawnAddr = pawn:GetAddress()   -- for the hooks, which must tell our player from anything else
+    if on("sync_story") then
+        tryInstallStoryHooks()
+        if S.tickCount % 3 == 2 then
+            local ok, err = pcall(storyTick, pawn)
+            if not ok then warnOnce("story:" .. tostring(err), "story sync error: " .. tostring(err)) end
+        end
+    end
+
+    -- dying together, and staying in the same load as the host
+    if S.msgUntil and os.clock() >= S.msgUntil then hideMessage() end
+    if S.tickCount % 5 == 2 then
+        local ok, err = pcall(deathTick, pawn)
+        if not ok then warnOnce("death:" .. tostring(err), "death check error: " .. tostring(err)) end
+    end
+    if S.role == "join" and on("sync_saves") and peer.connected and not S.mirror and not S.restart and not S.autoJoin
+        and os.clock() - S.loadedAt > 8 then
+        if S.loadedOnOurOwn then
+            -- we loaded a save of our own while the host is playing: take the host's game instead
+            S.loadedOnOurOwn = nil
+            rejoinHost("this load did not come from the host", nil)
+        elseif peer.gen and S.joinedGen and peer.gen ~= S.joinedGen then
+            rejoinHost("the host is in another load", nil)
+        end
+    end
+
     if S.releaseMoveAt and os.clock() >= S.releaseMoveAt then
         S.releaseMoveAt = nil
         pcall(function() pawn.CharacterMovement:SetMovementMode(1, 0) end)   -- 1 = walking
@@ -2497,6 +3329,15 @@ local function tick()
     elseif S.tickCount % INVENTORY_EVERY == 0 then
         local ok, err = pcall(pollInventory, pawn)
         if not ok then warnOnce("inv:" .. tostring(err), "inventory poll error: " .. tostring(err)) end
+    end
+    if S.muzzleOffAt and os.clock() >= S.muzzleOffAt then
+        S.muzzleOffAt = nil
+        pcall(function() S.muzzle:SetIntensity(0) end)
+    end
+    if on("show_peer_shots") then tryInstallShotHook() end
+    if S.tickCount % 30 == 9 and os.clock() - (S.loadedAt or os.clock()) > 15 then
+        local ok, err = pcall(ammoTick, pawn)
+        if not ok then warnOnce("ammo:" .. tostring(err), "unlimited ammo error: " .. tostring(err)) end
     end
 
     -- Measure and send ourselves at the configured rate (the tick itself runs at up to 30 Hz).
@@ -2698,4 +3539,7 @@ local function tickAndDraw()
 end
 
 return { version = VERSION, tick = tickAndDraw, onKey = onKey, onFrame = onFrame, onMelee = onMeleeSwing,
-    onLocalSave = onLocalSave, onMenuClick = onMenuClick }
+    onLocalSave = onLocalSave, onMenuClick = onMenuClick, onShot = onLocalShot,
+    onTrigger = onLocalTrigger, onUse = onLocalUse,
+    -- for tools\cmd probes: handle a line as if the other player had sent it
+    debugEvent = function(text) local p = getPawn() if p then handleEvent(p, text) end end }
