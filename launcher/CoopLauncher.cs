@@ -509,7 +509,7 @@ namespace SH2CoopMod
 
     class MainForm : Form
     {
-        const string Version = "0.21";
+        const string Version = "0.22";
         const string Author = "MarySue";
         const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
@@ -520,8 +520,8 @@ namespace SH2CoopMod
         static readonly string[] ToggleKeys = { "share_inventory", "host_inventory_wins", "share_ammo", "share_healing", "share_documents",
             "share_key_items", "show_other_player", "show_held_items", "sync_flashlight", "flashlight_shadows", "show_my_model_to_me",
             "sync_doors", "other_player_collision", "friendly_fire", "sync_cutscenes", "sync_enemies", "sync_puzzles", "sync_pushables",
-            "sync_saves", "unlimited_ammo", "sync_story", "shared_death" };
-        static readonly string[] ToggleDefaults = { "1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1", "1", "0", "0", "1", "1", "1", "1", "1", "0", "1", "1" };
+            "sync_saves", "unlimited_ammo", "sync_story", "shared_death", "show_name_tag" };
+        static readonly string[] ToggleDefaults = { "1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1", "1", "0", "0", "1", "1", "1", "1", "1", "0", "1", "1", "1" };
         static readonly int[] SendRates = { 30, 15, 10 };
 
         readonly bool demo;
@@ -808,7 +808,7 @@ namespace SH2CoopMod
             foreach (string k in new string[] { "host_inventory_wins", "share_ammo", "share_healing", "share_documents", "share_key_items" }) tg[k].Enabled = inv;
             bool other = tg["show_other_player"].Checked;
             tg["show_held_items"].Enabled = other; sl["other_player_scale"].Enabled = other;
-            tg["other_player_collision"].Enabled = other;
+            tg["other_player_collision"].Enabled = other; tg["show_name_tag"].Enabled = other;
             sl["ff_hit_damage"].Enabled = tg["friendly_fire"].Checked;
             bool fl = tg["sync_flashlight"].Checked;
             tg["flashlight_shadows"].Enabled = fl; sl["flashlight_brightness"].Enabled = fl;
@@ -907,13 +907,14 @@ namespace SH2CoopMod
             PutSlider(net, "interp_delay_ms", 16, 86, 303, "Smoothing delay", 0, 300, 10, " ms");
             PutSlider(net, "peer_timeout_s", 16, 142, 303, "Hide other player after silence", 1, 10, 1, " s");
 
-            Card other = PutCard(p, "Other player", 347, 0, 335, 242);
+            Card other = PutCard(p, "Other player", 347, 0, 335, 288);
             PutToggle(other, "show_other_player", 16, 40, 303, "Show the other player", "Draw their body in my world");
-            PutToggle(other, "show_held_items", 16, 86, 303, "Held items", "Weapon, flashlight and radio on their body");
-            PutToggle(other, "other_player_collision", 16, 132, 303, "Collision", "Their body blocks me, and enemies too");
-            PutSlider(other, "other_player_scale", 16, 182, 303, "Size", 50, 150, 5, " %");
+            PutToggle(other, "show_name_tag", 16, 86, 303, "Name above their head", "In white, also seen through walls");
+            PutToggle(other, "show_held_items", 16, 132, 303, "Held items", "Weapon, flashlight and radio on their body");
+            PutToggle(other, "other_player_collision", 16, 178, 303, "Collision", "Their body blocks me, and enemies too");
+            PutSlider(other, "other_player_scale", 16, 228, 303, "Size", 50, 150, 5, " %");
 
-            Card flash = PutCard(p, "Flashlight", 347, 254, 335, 196);
+            Card flash = PutCard(p, "Flashlight", 347, 300, 335, 196);
             PutToggle(flash, "sync_flashlight", 16, 40, 303, "Their flashlight lights my world", "A real beam, aimed where they aim");
             PutToggle(flash, "flashlight_shadows", 16, 86, 303, "Beam casts shadows", "Looks better, costs performance");
             PutSlider(flash, "flashlight_brightness", 16, 136, 303, "Beam brightness", 25, 300, 25, " %");
@@ -1363,6 +1364,7 @@ namespace SH2CoopMod
             if (!GameFound) { ShowPage(0); MessageBox.Show(this, "Choose the game folder first.", "SH2-CoopMod"); return; }
             if (!ModInstalled) { MessageBox.Show(this, "Install the mod first.", "SH2-CoopMod"); return; }
             if (!EnsureModCurrent()) return;
+            if (!GameRunning) RemoveOldCoopSave();   // not under a running game: it may have the file open
             IPAddress peer;
             if (!IPAddress.TryParse(ipBox.Value.Trim(), out peer) || peer.AddressFamily != AddressFamily.InterNetwork)
             {
@@ -1529,8 +1531,53 @@ namespace SH2CoopMod
         // and sends the file back -> it lands in the joiner's co-op slot -> save_ready.txt tells
         // the joiner's mod to load it.
 
-        const int CoopSlot = 9;                          // the mod uses the same number; never one of the player's own slots
+        // The game has 13 save slots, 0 to 12, and its save list, load list and "Continue" look
+        // at those only. A number beyond that can still be saved to and loaded from, so the
+        // co-op save lives there and never shows in the game's own menus. Up to 0.21 it was
+        // slot 9, one of the player's ten manual slots.
+        const int CoopSlot = 40;
+        const int OldCoopSlot = 9;
         const int MaxSaveBytes = 64 * 1024 * 1024;
+
+        // A save written by the mod for this purpose carries the title "Co-op" in its header;
+        // nothing the game writes itself does (those say "SavePoint" or "Autosave").
+        static bool IsCoopSave(string file)
+        {
+            try
+            {
+                byte[] head = new byte[256];
+                int n;
+                using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) n = fs.Read(head, 0, head.Length);
+                byte[] mark = { 6, 0, 0, 0, (byte)'C', (byte)'o', (byte)'-', (byte)'o', (byte)'p', 0 };
+                for (int i = 0; i + mark.Length <= n; i++)
+                {
+                    int k = 0;
+                    while (k < mark.Length && head[i + k] == mark[k]) k++;
+                    if (k == mark.Length) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        // The co-op save that 0.21 and older left in slot 9 sits in the player's own save list
+        // as an entry without a location. Once this version keeps it elsewhere, take it out.
+        // Only ever a file the mod wrote itself.
+        void RemoveOldCoopSave()
+        {
+            try
+            {
+                string dir = TestSaveDir != null ? TestSaveDir : FindSaveDir();
+                if (dir == null) return;
+                string old = Path.Combine(dir, "SaveGameData_" + OldCoopSlot + ".sav");
+                if (File.Exists(old) && IsCoopSave(old))
+                {
+                    File.Delete(old);
+                    Log("Removed the old co-op save from slot " + OldCoopSlot + " of the game's save list. It is now kept outside the game's own slots.");
+                }
+            }
+            catch (Exception ex) { Log("Could not remove the old co-op save: " + ex.Message); }
+        }
 
         // The game keeps saves in a folder named after the account; take the one in use.
         static string FindSaveDir()
@@ -1684,6 +1731,7 @@ namespace SH2CoopMod
                 if (dir == null) throw new Exception("this PC's save folder was not found (start the game once first)");
                 File.WriteAllBytes(Path.Combine(dir, "SaveGameData_" + CoopSlot + ".sav"), data);
                 answer = "ok " + CoopSlot;
+                RemoveOldCoopSave();   // the copy an older version kept in the player's own list
                 Log("Host's save received (" + (data.Length / 1024) + " KB). The game is loading it.");
             }
             catch (Exception ex)

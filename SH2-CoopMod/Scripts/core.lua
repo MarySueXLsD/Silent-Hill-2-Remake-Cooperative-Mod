@@ -25,7 +25,7 @@
 local ctx = ...
 local UEHelpers = ctx.UEHelpers
 local log = ctx.log
-local VERSION = "0.21"
+local VERSION = "0.22"
 
 local DIR = ctx.root .. "\\ipc"
 local OUT_FILE = DIR .. "\\out.txt"
@@ -166,7 +166,7 @@ local DEFAULTS = {
     sync_enemies = "1",         -- enemies share health and targets, and follow the host's positions
     sync_puzzles = "1",         -- a puzzle solved by one player is solved for both
     sync_pushables = "1",       -- furniture one player pushes moves for both
-    sync_saves = "1",           -- the joiner saves when the host saves, and loads when the host loads
+    sync_saves = "1",           -- when the host loads a save, the joiner joins that load
     other_player_collision = "0", -- the other player's body blocks me (and enemies)
     friendly_fire = "0",        -- my attacks hurt the other player (both must enable it)
     unlimited_ammo = "0",       -- ammunition never runs out, for both players if either enables it
@@ -174,6 +174,7 @@ local DEFAULTS = {
     sync_story = "1",           -- story triggers, switches and pickup events fire in both games
     show_peer_pickups = "1",    -- the game's "item collected" popup for what the other player picks up
     show_peer_shots = "1",      -- muzzle flash and gunshot sound at the other player when they fire
+    show_name_tag = "1",        -- the other player's name above their head, drawn over everything
     ff_hit_damage = "10",       -- health lost per melee hit, my estimate of one enemy hit; a shot is double
     show_other_player = "1",    -- draw the other player at all
     other_player_scale = "100", -- their size on my screen, percent
@@ -789,6 +790,7 @@ local function spawnAvatar(pawn)
     S.heldApplied = nil
     S.lightComp = nil
     S.muzzle, S.muzzleOffAt = nil, nil
+    S.muzzleFx, S.muzzleFxKind, S.akHold = nil, nil, nil
     S.capsule = nil
     S.collisionOn = nil
     S.avatarScale = nil
@@ -973,7 +975,19 @@ local function ensureLight(pawn)
         pcall(function() sourceRadius, softRadius = src.SourceRadius, src.SoftSourceRadius end)
         pcall(function() volumetric, specular = src.VolumetricScatteringIntensity, src.SpecularScale end)
         pcall(function() fnFade = src.LightFunctionFadeDistance end)
-        pcall(function() light:SetLightFunctionMaterial(src.LightFunctionMaterial) end)
+        pcall(function()
+            -- Never the very object our own flashlight is using. The game makes that one at
+            -- run time and rewrites it as it goes (other settings per area, flicker), and a
+            -- second light built on it is left holding a material that changes under it. The
+            -- asset it was made from gives the same picture, and nobody edits an asset.
+            local fn = src.LightFunctionMaterial
+            for _ = 1, 4 do
+                if not (fn and fn:IsValid()) then return end
+                if not fn:GetClass():GetFName():ToString():find("Dynamic", 1, true) then break end
+                fn = fn.Parent
+            end
+            if fn and fn:IsValid() then light:SetLightFunctionMaterial(fn) end
+        end)
         pcall(function() light:SetLightFunctionScale(src.LightFunctionScale) end)
         pcall(function() light:SetIESTexture(src.IESTexture) end)
     end
@@ -1061,9 +1075,132 @@ local function sampleSnaps(rt)
     return snaps[1], snaps[1], 0
 end
 
+-- ---------------------------------------------------------------- the other player's name
+
+-- Their name floats above their head, in white. It is drawn on the game's HUD and not in the
+-- world, so walls do not hide it: it shows where the other player is even when their body
+-- cannot be seen. The name is what they typed as "Your name" in their launcher; it travels in
+-- the packets as hex, because the launchers carry packets as plain ASCII and names need not be.
+local TAG = {}
+-- A tag made by an earlier load of this file in the same game session is dropped, so the one on
+-- screen is always built by the code as it is now.
+if S.tagText then
+    pcall(function()
+        if S.tagText:IsValid() then
+            S.tagText:SetVisibility(1)
+            S.tagText:RemoveFromParent()
+        end
+    end)
+end
+S.tagText, S.tagSlot, S.tagShown, S.tagName, S.tagTried = nil, nil, nil, nil, nil
+
+function TAG.hex(s)
+    s = tostring(s)
+    -- at most 24 characters, cut between characters and not inside one (names may be Cyrillic)
+    local okCut, cut = pcall(function() return utf8.offset(s, 25) end)
+    if okCut and cut then s = s:sub(1, cut - 1) elseif #s > 96 then s = s:sub(1, 96) end
+    return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+function TAG.unhex(h)
+    local s = h:gsub("%x%x", function(x) return string.char(tonumber(x, 16)) end)
+    s = s:gsub("%c", "")            -- no line breaks or other control characters in a name
+    return (#s > 0) and s:sub(1, 96) or nil
+end
+
+function TAG.hide()
+    if S.tagShown then
+        S.tagShown = false
+        local t = S.tagText
+        if t and t:IsValid() then pcall(function() t:SetVisibility(1) end) end   -- 1 = collapsed
+    end
+end
+
+-- The text block, made on first use and again after every load (the HUD is new then).
+function TAG.widget()
+    local t = S.tagText
+    if t and t:IsValid() then return t end
+    local now = os.clock()
+    if now - (S.tagTried or -100) < 2 then return nil end   -- no HUD yet (loading, cutscene): look again shortly
+    S.tagTried = now
+    local hud = FindFirstOf("SHGameplayHudWidget")
+    if not (hud and hud:IsValid()) then return nil end
+    S.tagCount = (S.tagCount or 0) + 1
+    t = StaticConstructObject(StaticFindObject("/Script/UMG.TextBlock"), hud.WidgetTree, FName("CoopNameTag" .. S.tagCount))
+    if not (t and t:IsValid()) then return nil end
+    pcall(function()   -- the HUD's own font, a little smaller than its notifications
+        for _, tb in ipairs(FindAllOf("TextBlock") or {}) do
+            if tb:IsValid() and tb:GetFName():ToString() == "NotificationText_CurrentAmmo" then
+                t:SetFont(tb.Font)
+                break
+            end
+        end
+        local font = t.Font
+        font.Size = 15
+        pcall(function()   -- a thin dark edge keeps white letters readable on fog and lit walls
+            font.OutlineSettings.OutlineSize = 1
+            font.OutlineSettings.OutlineColor = { R = 0, G = 0, B = 0, A = 0.85 }
+        end)
+        t:SetFont(font)
+    end)
+    pcall(function() t:SetColorAndOpacity({ SpecifiedColor = { R = 1, G = 1, B = 1, A = 1 }, ColorUseRule = 0 }) end)
+    pcall(function()
+        t:SetShadowOffset({ X = 1.5, Y = 1.5 })
+        t:SetShadowColorAndOpacity({ R = 0, G = 0, B = 0, A = 0.9 })
+    end)
+    pcall(function() t:SetJustification(1) end)
+    local slot = hud.MainContainer:AddChild(t)
+    pcall(function()
+        slot:SetAnchors({ Minimum = { X = 0, Y = 0 }, Maximum = { X = 0, Y = 0 } })
+        slot:SetAlignment({ X = 0.5, Y = 1.0 })   -- the point we place is the middle of its bottom edge
+        slot:SetAutoSize(true)
+        slot:SetZOrder(40)
+    end)
+    pcall(function() t:SetVisibility(1) end)
+    S.tagText, S.tagSlot, S.tagShown, S.tagName = t, slot, false, nil
+    return t
+end
+
+-- Every rendered frame while the other player's body is shown.
+function TAG.draw(pawn)
+    if not on("show_name_tag") then TAG.hide() return end
+    local t = TAG.widget()
+    if not t then return end
+    local name = (not S.mirror and peer.name) or (S.mirror and cfg.player_name) or "Player"   -- the solo test shows our own
+    if S.tagName ~= name then
+        S.tagName = name
+        pcall(function() t:SetText(FText(name)) end)
+    end
+    -- a little above the top of their head (the head bone sits at the base of the skull)
+    local world
+    pcall(function()
+        local comp = S.avatarComp
+        if comp:GetBoneIndex(BONES[9]) >= 0 then   -- head_bn
+            local h = comp:GetSocketLocation(BONES[9])
+            world = { X = h.X, Y = h.Y, Z = h.Z + 26 }
+        end
+    end)
+    if not world then
+        local a = S.avatar:K2_GetActorLocation()
+        world = { X = a.X, Y = a.Y, Z = a.Z + 195 }
+    end
+    if not (S.wll and S.wll:IsValid()) then S.wll = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary") end
+    local pos = {}
+    local ok, inFront = pcall(function() return S.wll:ProjectWorldLocationToWidgetPosition(pawn.Controller, world, pos, false) end)
+    if not (ok and inFront and pos.X) then TAG.hide() return end   -- behind the camera
+    pcall(function() S.tagSlot:SetPosition({ X = pos.X, Y = pos.Y }) end)
+    if not S.tagShown then
+        S.tagShown = true
+        pcall(function() t:SetVisibility(3) end)   -- 3 = shown, and never in the way of the mouse
+    end
+end
+
 -- Runs every rendered frame: draw the other player.
 local function frame()
     S.frameCount = (S.frameCount or 0) + 1
+    -- a load is starting and our things are already out of the world, or one has just finished
+    -- and the level is not running yet
+    if S.leaving or S.pawnGone then TAG.hide() return end
     local pawn = getPawn()
     if not pawn then return end
 
@@ -1074,6 +1211,7 @@ local function frame()
     -- hidden when there is no news of them, when switched off, and while we watch a cutscene
     if #S.snaps == 0 or (now - peer.lastTime) > staleSeconds() or not on("show_other_player") or S.cutPlaying then
         setAvatarVisible(false)
+        TAG.hide()
         return
     end
     if not S.avatar or not S.avatar:IsValid() then
@@ -1117,6 +1255,9 @@ local function frame()
                 false, {}, true)
         end
     end
+
+    local okTag, errTag = pcall(TAG.draw, pawn)
+    if not okTag then warnOnce("tag:" .. tostring(errTag), "name tag error: " .. tostring(errTag)) end
 end
 
 -- ================================================================ collision with the other player
@@ -1728,62 +1869,24 @@ end
 
 -- ================================================================ saving and loading together
 
--- Each PC keeps its own save files. The two games are kept in the same load like this:
---   * When the host's game saves, the joiner's game saves at the same moment (into the same
---     slot number when the host used one), so the joiner's own files keep up with the story.
---   * When the host loads a save, or the pair restarts after a death, the joiner does not load
---     a file of its own. It goes back to the main menu and joins the host's game again, which
---     copies the host's state over: see rejoinHost and "joining from the main menu".
-
-local SAVE_FUNCTIONS = { "MakeFullSave", "SaveGame", "MakeQuickSave", "AutoSave" }
+-- Each PC keeps its own save files, and the mod leaves the joiner's alone. When the host loads a
+-- save, or the pair restarts after a death, the joiner does not load a file of its own: it goes
+-- back to the main menu and joins the host's game again, which copies the host's state over
+-- (see rejoinHost and "joining from the main menu").
+--
+-- Up to 0.21 the joiner's game also saved whenever the host's did, into the same slot number.
+-- That is gone. A save written from here, outside a save point, carries no location: the
+-- game's own save list shows every other save with one, and the slot number was the host's, so
+-- it could land on top of a save the joiner had made themselves. The joiner's game still makes
+-- its own autosaves as they play.
 
 local function gameStatics()
     local st = StaticFindObject("/Script/GameBase.Default__GameBaseStatics")
     return (st and st:IsValid()) and st or nil
 end
 
--- Called from the hooks below whenever this game saves.
-local function onLocalSave(fn, slot)
-    if S.savingForPeer or not on("sync_saves") then return end
-    if S.role == "join" or S.mirror or not peer.connected then return end
-    local now = os.clock()
-    if now - (S.lastSaveSent or -100) < 5 then return end   -- one save can call several of these
-    S.lastSaveSent = now
-    enqueue("saved " .. tostring(slot))
-    log("you saved; the joiner's game will save too")
-end
-
-local function tryInstallSaveHooks()
-    if S.saveHooks then return end
-    S.saveHooks = {}
-    for _, fn in ipairs(SAVE_FUNCTIONS) do
-        local ok = pcall(RegisterHook, "/Script/GameBase.GameBaseStatics:" .. fn, function(_, _, firstParam)
-            local slot = -1
-            if fn == "MakeFullSave" then pcall(function() slot = math.floor(firstParam:get()) end) end
-            local impl = SH2CoopMod.impl
-            if impl and impl.onLocalSave then pcall(impl.onLocalSave, fn, slot) end
-        end)
-        S.saveHooks[fn] = ok
-    end
-    local names = {}
-    for fn, ok in pairs(S.saveHooks) do if ok then names[#names + 1] = fn end end
-    log("save hooks installed: " .. (#names > 0 and table.concat(names, ", ") or "none"))
-end
-
 onRemoteSaved = function(pawn, slot)
-    if not on("sync_saves") or S.role ~= "join" then return end
-    local st = gameStatics()
-    if not st then return end
-    S.savingForPeer = true
-    local ok, err = pcall(function()
-        if slot >= 0 then
-            st:MakeFullSave(pawn:GetWorld(), slot, "Co-op", false, true)
-        else
-            st:AutoSave(pawn:GetWorld(), "Co-op", false, true)
-        end
-    end)
-    S.savingForPeer = nil
-    log(ok and "saved here because the host saved" or ("could not save with the host: " .. tostring(err)))
+    -- still sent by a host on 0.21 or older; deliberately not acted on
 end
 
 -- The joiner gets back into the host's world the same way they first got in: through the main
@@ -2437,9 +2540,18 @@ local TRIGGER_CLASSES = {
     "/Game/WWise/Blueprints/OneShot/OneShotEventController_BP.OneShotEventController_BP_C",
 }
 local TRIGGER_FAMILIES = { "TriggerBase_BP_C", "OneShotEventController_BP_C" }
--- Triggers about where *this* player is (what to stream in, where to crouch, what the map
--- shows, when enemies give up) are each game's own business and are left alone.
-local TRIGGER_PRIVATE = { "Streaming", "PlayerExit", "EnableVolumes", "Cover", "NarrowPassage", "MapObject", "Activity", "ResetAggro", "Music" }
+-- Which triggers are shared is decided by what a trigger is built on, all the way up, and not
+-- by its own name. "TriggerLightWoodside" says nothing, but underneath it is a
+-- "TriggerDirectionalPlayerExit": a trigger about where one player stands, which swaps that
+-- player's flashlight settings as they step in and out of a flat. 0.20 and 0.21 judged by the
+-- name alone and fired it in the other game, on a player who was somewhere else.
+-- So: only the kinds known to carry story are shared. Anything built on a kind that is about
+-- one player's whereabouts stays private, and so does any kind this list has never heard of.
+local TRIGGER_SHARED = {
+    TriggerCutscene_BP_C = true, TriggerAI_BP_C = true, TriggerSound_BP_C = true,
+    Trigger_MQChangeAmbush_BP_C = true, OneShotEventController_BP_C = true,
+}
+local TRIGGER_PRIVATE = { "Streaming", "PlayerExit", "EnableVolumes", "Cover", "NarrowPassage", "MapObject", "Activity", "ResetAggro", "Music", "Light" }
 
 local USE_CLASS = "/Game/Game/Gameplay/Interactions/GenericBase_BP.GenericBase_BP_C"
 local USE_EVENT = "BndEvt__Generic_A_K2Node_ComponentBoundEvent_0_GrabbedByCharacterBP__DelegateSignature"
@@ -2464,6 +2576,33 @@ local function nameHasAny(name, words)
         if name:find(w, 1, true) then return true end
     end
     return false
+end
+
+-- Is this trigger one whose effect belongs to both players? Answered once per class.
+S.trigClass = S.trigClass or {}
+local function sharedTrigger(t)
+    local cls = t:GetClass()
+    local leaf = cls:GetFName():ToString()
+    local known = S.trigClass[leaf]
+    if known ~= nil then return known end
+    local shared = false
+    if leaf == "TriggerBase_BP_C" then
+        shared = true   -- the plain trigger the levels wire their own events to
+    else
+        local name = leaf
+        for _ = 1, 8 do
+            if nameHasAny(name, TRIGGER_PRIVATE) then shared = false break end
+            if TRIGGER_SHARED[name] then shared = true end   -- keep climbing: a private kind above still wins
+            if name == "TriggerBase_BP_C" then break end
+            local okUp, up = pcall(function() return cls:GetSuperStruct() end)
+            if not (okUp and up and up:IsValid()) then break end
+            cls = up
+            name = cls:GetFName():ToString()
+        end
+    end
+    S.trigClass[leaf] = shared
+    if not shared then log("triggers of the kind " .. leaf .. " stay with the player who set them off") end
+    return shared
 end
 
 -- Called from the hooks, in the middle of the game's own work: only take a note.
@@ -2533,6 +2672,7 @@ onRemoteUse = function(id)
 end
 
 local function applyTrigger(pawn, t, id, entering)
+    if not sharedTrigger(t) then return end   -- sent by a 0.20 or 0.21 game, which shared too much
     if not entering and S.trigInside[id] then return end   -- we are standing in it ourselves
     S.trigApplying = true
     local ran = risky("trigger", id, function()
@@ -2577,7 +2717,7 @@ storyTick = function(pawn)
             if t:IsValid() then
                 local id = objectId(t)
                 S.trigInside[id] = entering or nil
-                if settled and together and not nameHasAny(t:GetClass():GetFName():ToString(), TRIGGER_PRIVATE) then
+                if settled and together and sharedTrigger(t) then
                     local key = id .. (entering and "+" or "-")
                     if now - (S.trigSent[key] or -100) > 1.0 then
                         S.trigSent[key] = now
@@ -2643,97 +2783,257 @@ end   -- of the story block
 -- ================================================================ gunshots
 
 -- The other player's body copies their pose, so it aims and recoils, but a pose carries no
--- muzzle flash and no sound. So every shot is sent as an event, and the other game answers with
--- a short flash of light at the body's gun hand and the weapon's own gunshot sound played from
--- that spot.
+-- muzzle flash and no sound. So every shot is sent as an event, and the other game answers at
+-- the body's gun: the game's own muzzle-flash effect for that kind of weapon, a short flash of
+-- light, and the weapon's own gunshot sound played from that spot.
+--
+-- Hearing about our own shots took two tries. 0.20 and 0.21 hooked the weapon's "fire
+-- performed" events. Those are only ever called for a weapon whose blueprint fills them in;
+-- for the others the game calls nothing, so no shot was ever sent and the other player saw and
+-- heard none. What the game does do on every shot is tell its own listeners (stress,
+-- statistics) through the ranged-combat component. 0.22 listens to those same calls, and as a
+-- net under that watches the number of rounds in the clip: one fewer is a shot.
+local SHOT = {}   -- (one table for the helpers: Lua allows a file only 200 top-level locals)
+S.shotSaid, S.shotHeard = nil, nil   -- the log describes the first shot each way after every load of this file
+SHOT.FLASH = {    -- the game's muzzle-flash effect for each kind of firearm
+    pistol = "/Game/Game/FX/Weapons/Pistol/FX_NS_MuzzleFlashPistol.FX_NS_MuzzleFlashPistol",
+    shotgun = "/Game/Game/FX/Weapons/Shotgun/MainFX/FX_NS_MuzzleFlashShotgun.FX_NS_MuzzleFlashShotgun",
+    rifle = "/Game/Game/FX/Weapons/Rifle/FX_NS_MuzzleFlashRifle.FX_NS_MuzzleFlashRifle",
+}
+SHOT.SOUND = {    -- and its gunshot, for when the message does not name one
+    pistol = "/Game/WWiseAudio/Events/Characters/James/James_Weapons/Pistol/Play_Wpn_Pistol_Shot.Play_Wpn_Pistol_Shot",
+    shotgun = "/Game/WWiseAudio/Events/Characters/James/James_Weapons/Shotgun/Play_Wpn_Shotgun_Shot.Play_Wpn_Shotgun_Shot",
+    rifle = "/Game/WWiseAudio/Events/Characters/James/James_Weapons/Rifle/Play_Wpn_Rifle_Shot.Play_Wpn_Rifle_Shot",
+}
 
-local function onLocalShot(weapon)
-    if S.mirror or not peer.connected then return end
+function SHOT.kindOf(text)
+    text = tostring(text or ""):lower()
+    if text:find("shotgun", 1, true) then return "shotgun" end
+    if text:find("rifle", 1, true) then return "rifle" end
+    return "pistol"
+end
+
+-- The firearm in our hands right now, if any. (The game only keeps a weapon as an object in
+-- the world while it is drawn.)
+function SHOT.inHand(pawn)
+    local addr = pawn:GetAddress()
+    local guns = FindAllOf("SHItemWeaponRanged")
+    for i = 1, guns and #guns or 0 do
+        local g = guns[i]
+        if g:IsValid() then
+            local mine = false
+            pcall(function() mine = g.OwnerCharacter:GetAddress() == addr and not g.bHidden end)
+            if mine then return g end
+        end
+    end
+    return nil
+end
+
+-- `weapon` is the firearm when the caller knows it; `key` is the game's name for it when all
+-- the caller saw was its clip count going down.
+local function onLocalShot(weapon, key)
+    if not (S.mirror or peer.connected) then return end
     local now = os.clock()
-    if now - (S.lastShotSent or -1) < 0.08 then return end   -- a shotgun reports one shot twice
+    if now - (S.lastShotSent or -1) < 0.12 then return end   -- one shot is reported by several listeners
     S.lastShotSent = now
-    -- name the gunshot sound itself, so the other game does not need this gun in hand to play it
-    local sound = "gun"
-    pcall(function()
-        local ev = weapon.WeaponItemAudioComponent.ShootAudioEvent
-        local path = ev:GetFullName():match("^%S+%s+(%S+)$")
-        if path then sound = path end
-    end)
-    enqueue("shot " .. sound)
+    local pawn = getPawn()
+    if not (weapon and weapon:IsValid()) and pawn then weapon = SHOT.inHand(pawn) end
+    -- The gunshot sound is named itself, so the other game does not need this gun in hand to
+    -- play it, and the muzzle is given as a spot measured from the weapon's own origin, so the
+    -- other game can put the flash there on its copy of the gun.
+    local sound, kind, mx, my, mz = "gun", SHOT.kindOf(key), 0, 0, 0
+    if weapon and weapon:IsValid() then
+        pcall(function()
+            local path = weapon.WeaponItemAudioComponent.ShootAudioEvent:GetFullName():match("^%S+%s+(%S+)$")
+            if path then sound = path end
+        end)
+        pcall(function()
+            kind = SHOT.kindOf(weapon:GetClass():GetFName():ToString() .. " " .. weapon.WeaponAmmoItem.RowName:ToString() .. " " .. tostring(key or ""))
+        end)
+        pcall(function()
+            local kml = StaticFindObject("/Script/Engine.Default__KismetMathLibrary")
+            local rel = kml:InverseTransformLocation(weapon.RootComponent:K2_GetComponentToWorld(), weapon.RegisteredFirePoint:K2_GetComponentLocation())
+            mx, my, mz = rel.X, rel.Y, rel.Z
+        end)
+    end
+    local text = string.format("%s %s %d %d %d", sound, kind, math.floor(mx + 0.5), math.floor(my + 0.5), math.floor(mz + 0.5))
+    if S.mirror then
+        if pawn then pcall(onRemoteShot, pawn, text) end   -- solo test: your copy fires when you do
+    else
+        enqueue("shot " .. text)
+    end
+    if not S.shotSaid then
+        S.shotSaid = true
+        log("you fired (" .. kind .. "); " .. (S.mirror and "your copy fires with you (solo test)" or "every shot is told to the other player"))
+    end
 end
 
 local function tryInstallShotHook()
-    if S.shotHook ~= nil then return end
-    local any = false
-    for _, fn in ipairs({ "OnFirePerformed", "OnFireSpreadPerformed" }) do
-        local ok = pcall(RegisterHook, "/Script/SHProto.SHItemWeaponRanged:" .. fn, function(self)
+    if S.fireHooks ~= nil then return end
+    local function listener(pick)
+        return function(...)
             local impl = SH2CoopMod.impl
-            if impl and impl.onShot then pcall(impl.onShot, self:get()) end
+            if not (impl and impl.onShot) then return end
+            local weapon
+            local args = { ... }
+            pcall(function() weapon = args[pick]:get() end)
+            pcall(impl.onShot, weapon)
+        end
+    end
+    local names = {}
+    -- what the game itself calls on every successful shot: (self, ranged component, weapon)
+    for _, cls in ipairs({ "SHStressCmbSubcomp", "SHCombatStatisticsValueProcessor" }) do
+        if pcall(RegisterHook, "/Script/SHProto." .. cls .. ":ProcessRangedFireSuccess", listener(3)) then names[#names + 1] = cls end
+    end
+    -- and the weapon's own events, for the weapons that have them (an earlier version of this
+    -- file may have hooked these already in this game session: not twice)
+    if S.shotHook == nil then
+        for _, fn in ipairs({ "OnFirePerformed", "OnFireSpreadPerformed" }) do
+            pcall(RegisterHook, "/Script/SHProto.SHItemWeaponRanged:" .. fn, listener(1))
+        end
+        S.shotHook = true
+    end
+    S.fireHooks = #names
+    log("shot listeners installed: " .. (#names > 0 and table.concat(names, ", ") or "none; the clip count alone is watched"))
+end
+
+-- The net under the listeners: the game keeps the number of rounds in each weapon's clip in
+-- one table. A count that went down means a round was fired.
+function SHOT.poll(pawn)
+    local ranged = S.ranged
+    -- Not watched for a while (nobody was connected): what was fired meanwhile is not news, so
+    -- the counts are taken afresh and nothing is reported on this pass.
+    local clock = os.clock()
+    if clock - (S.clipAt or -10) > 1.0 then S.clip = {} end
+    S.clipAt = clock
+    if not (ranged and ranged:IsValid() and S.rangedPawn == S.pawnAddr) then
+        ranged = nil
+        pcall(function() ranged = pawn.Combat:FindSubcomponentByClass(StaticFindObject("/Script/SHProto.SHRangedCmbSubcomp")) end)
+        S.ranged, S.rangedPawn, S.clip = ranged, S.pawnAddr, {}
+        if not (ranged and ranged:IsValid()) then return end
+    end
+    local now = {}
+    ranged.WeaponsAmmoCounts:ForEach(function(k, v) now[k:get():ToString()] = v:get() end)
+    for name, n in pairs(now) do
+        local was = S.clip[name]
+        S.clip[name] = n
+        if was and n < was then onLocalShot(nil, name) end
+    end
+end
+
+-- Where the muzzle of the other player's gun is on their body here, and which way it points.
+function SHOT.muzzle(mx, my, mz)
+    local gun
+    for _, c in ipairs(S.heldComps or {}) do   -- firearms are the held things with a skinned mesh
+        if c:IsValid() and c:GetClass():GetFName():ToString():find("Skeletal", 1, true) then gun = c end
+    end
+    if gun then
+        local loc, rot
+        pcall(function()
+            local kml = StaticFindObject("/Script/Engine.Default__KismetMathLibrary")
+            if mx == 0 and my == 0 and mz == 0 then mx = 18 end   -- not measured: a hand's width along the barrel
+            local l = kml:TransformLocation(gun:K2_GetComponentToWorld(), { X = mx, Y = my, Z = mz })
+            loc = { X = l.X, Y = l.Y, Z = l.Z }
+            local r = gun:K2_GetComponentRotation()
+            rot = { Pitch = r.Pitch, Yaw = r.Yaw, Roll = r.Roll }
         end)
-        any = any or ok
+        if loc then return loc, rot end
     end
-    S.shotHook = any
-    log(any and "shot hook installed" or "shot hook could not be installed; the other player will not see your shots")
-end
-
-local function muzzleFlash(loc)
-    if not (S.muzzle and S.muzzle:IsValid()) then
-        local light = S.avatar:AddComponentByClass(StaticFindObject("/Script/Engine.PointLightComponent"), true, IDENT, false)
-        if not (light and light:IsValid()) then return end
-        light:SetMobility(2)
-        pcall(function() light:K2_AttachToComponent(S.avatarComp, FName("None"), 2, 2, 2, false) end)
-        pcall(function() light:SetIntensityUnits(0) end)             -- unitless, like the game's own lights
-        pcall(function() light.bUseInverseSquaredFalloff = false end)
-        pcall(function() light:SetLightFalloffExponent(4.01) end)    -- the nudge makes the setter take effect
-        pcall(function() light:SetLightFalloffExponent(4) end)
-        pcall(function() light:SetAttenuationRadius(700) end)
-        pcall(function() light:SetLightColor({ R = 1.0, G = 0.78, B = 0.5, A = 1.0 }, true) end)
-        pcall(function() light:SetCastShadows(false) end)
-        light:SetIntensity(0)
-        S.muzzle = light
-    end
-    pcall(function() S.muzzle:K2_SetWorldLocation(loc, false, {}, true) end)
-    S.muzzle:SetIntensity(45)
-    S.muzzleOffAt = os.clock() + 0.07
-end
-
-onRemoteShot = function(pawn, className)
-    if not (S.avatar and S.avatar:IsValid() and S.avatarComp and S.avatarComp:IsValid()) then return end
     local loc
     pcall(function()
-        local l = S.avatarComp:GetSocketLocation(FName("hand_r"))
-        if l.X ~= 0 or l.Y ~= 0 or l.Z ~= 0 then loc = { X = l.X, Y = l.Y, Z = l.Z } end
+        if S.avatarComp:GetBoneIndex(BONES[13]) >= 0 then   -- hand_r_bn
+            local l = S.avatarComp:GetSocketLocation(BONES[13])
+            loc = { X = l.X, Y = l.Y, Z = l.Z }
+        end
     end)
     if not loc then
         local a = S.avatar:K2_GetActorLocation()
         loc = { X = a.X, Y = a.Y, Z = a.Z + 120 }
     end
+    return loc, nil
+end
 
-    -- The message names the gunshot sound (an asset path). It is normally in memory already;
-    -- if not, any firearm we have out lends its shot, which is better than silence.
-    local event
-    if className:sub(1, 1) == "/" then event = findAsset(className) end
-    if not event then
-        local guns = FindAllOf("SHItemWeaponRanged")
-        for i = 1, guns and #guns or 0 do
-            local g = guns[i]
-            if g:IsValid() and not event then
-                pcall(function()
-                    local ev = g.WeaponItemAudioComponent.ShootAudioEvent
-                    if ev and ev:IsValid() then event = ev end
-                end)
-            end
+-- A flash of light, and the game's own muzzle-flash effect. Both are made once per body and
+-- used again for every shot, which also keeps the effect in memory between shots.
+function SHOT.flash(loc, rot, kind)
+    if not (S.muzzle and S.muzzle:IsValid()) then
+        local light = S.avatar:AddComponentByClass(StaticFindObject("/Script/Engine.PointLightComponent"), true, IDENT, false)
+        if light and light:IsValid() then
+            light:SetMobility(2)
+            pcall(function() light:K2_AttachToComponent(S.avatarComp, FName("None"), 2, 2, 2, false) end)
+            pcall(function() light:SetIntensityUnits(0) end)             -- unitless, like the game's own lights
+            pcall(function() light.bUseInverseSquaredFalloff = false end)
+            pcall(function() light:SetLightFalloffExponent(4.01) end)    -- the nudge makes the setter take effect
+            pcall(function() light:SetLightFalloffExponent(4) end)
+            pcall(function() light:SetAttenuationRadius(900) end)
+            pcall(function() light:SetLightColor({ R = 1.0, G = 0.78, B = 0.5, A = 1.0 }, true) end)
+            pcall(function() light:SetCastShadows(false) end)
+            light:SetIntensity(0)
+            S.muzzle = light
         end
     end
-    if event then
+    if S.muzzle and S.muzzle:IsValid() then
+        pcall(function() S.muzzle:K2_SetWorldLocation(loc, false, {}, true) end)
+        S.muzzle:SetIntensity(140)
+        S.muzzleOffAt = os.clock() + 0.09
+    end
+
+    local system = findAsset(SHOT.FLASH[kind] or SHOT.FLASH.pistol)
+    if not system then return false end
+    if not (S.muzzleFx and S.muzzleFx:IsValid()) then
+        local fx = S.avatar:AddComponentByClass(StaticFindObject("/Script/Niagara.NiagaraComponent"), true, IDENT, false)
+        if not (fx and fx:IsValid()) then return false end
+        pcall(function() fx:K2_AttachToComponent(S.avatarComp, FName("None"), 2, 2, 2, false) end)
+        S.muzzleFx, S.muzzleFxKind = fx, nil
+    end
+    local fx = S.muzzleFx
+    if S.muzzleFxKind ~= kind then
+        fx:SetAsset(system, true)
+        S.muzzleFxKind = kind
+    end
+    fx:K2_SetWorldLocationAndRotation(loc, rot or { Pitch = 0, Yaw = 0, Roll = 0 }, false, {}, true)
+    fx:Activate(true)   -- true: start over, also when the last flash has not finished
+    return true
+end
+
+onRemoteShot = function(pawn, text)
+    if not (S.avatar and S.avatar:IsValid() and S.avatarComp and S.avatarComp:IsValid()) then return end
+    local sound, kind, mx, my, mz = text:match("^(%S+)%s*(%a*)%s*(%-?%d*)%s*(%-?%d*)%s*(%-?%d*)")
+    sound = sound or "gun"
+    kind = (kind and kind ~= "") and kind or SHOT.kindOf(sound)
+    local loc, rot = SHOT.muzzle(tonumber(mx) or 0, tonumber(my) or 0, tonumber(mz) or 0)
+
+    -- The message names the gunshot sound (an asset path). It is in memory when one of us has
+    -- had that weapon out; if not it is read from disk. Either way it is then held on to by a
+    -- sound component on the body, or the game would drop it again before the next shot.
+    local event
+    if sound:sub(1, 1) == "/" then event = findAsset(sound) end
+    if not event then event = findAsset(SHOT.SOUND[kind] or SHOT.SOUND.pistol) end
+    if not event then
+        local gun = SHOT.inHand(pawn)   -- any firearm we have out lends its shot: better than silence
+        if gun then pcall(function() event = gun.WeaponItemAudioComponent.ShootAudioEvent end) end
+    end
+    local playing = nil
+    if event and event:IsValid() then
+        if not (S.akHold and S.akHold:IsValid()) then
+            pcall(function() S.akHold = S.avatar:AddComponentByClass(StaticFindObject("/Script/AkAudio.AkComponent"), false, IDENT, false) end)
+        end
+        pcall(function() S.akHold.AkAudioEvent = event end)
         pcall(function()
             local ak = StaticFindObject("/Script/AkAudio.Default__AkGameplayStatics")
-            ak:PostEventAtLocation(event, loc, { Pitch = 0, Yaw = 0, Roll = 0 }, "", pawn)
+            playing = ak:PostEventAtLocation(event, loc, { Pitch = 0, Yaw = 0, Roll = 0 }, "", pawn)
         end)
     else
-        warnOnce("shot-sound", "no firearm loaded here to take the gunshot sound from")
+        warnOnce("shot-sound", "the other player's gunshot sound is not available here yet (" .. tostring(sound) .. ")")
     end
-    pcall(muzzleFlash, loc)
+    local okFlash, shown = pcall(SHOT.flash, loc, rot, kind)
+    if not okFlash then warnOnce("flash:" .. tostring(shown), "muzzle flash error: " .. tostring(shown)) end
+    S.shotsShown, S.shotShownAt = (S.shotsShown or 0) + 1, os.clock()   -- read by tools\cmd probes only
+    if not S.shotHeard then
+        S.shotHeard = true
+        log("the other player fired (" .. kind .. "): sound " .. ((playing and playing ~= 0) and "started" or "did not start")
+            .. ", muzzle flash " .. ((okFlash and shown) and "shown" or "light only"))
+    end
 end
 
 -- ================================================================ friendly fire
@@ -2876,6 +3176,7 @@ local function writeOut(pawn)
         S.session, S.seq, loc.X, loc.Y, loc.Z, rot.Yaw, speed, peer.applied, S.role,
         math.floor(os.clock() * 1000)) }
     lines[#lines + 1] = "V " .. VERSION   -- since 0.21; older versions skip lines they do not know
+    lines[#lines + 1] = "W " .. TAG.hex(cfg.player_name or "Player")   -- who we are, for the name tag
 
     local okPose, pose = pcall(capturePose, pawn)
     if okPose then
@@ -3005,6 +3306,12 @@ local function readIn(pawn)
             if snap and flOn then snap.fl, snap.fp, snap.fy = tonumber(flOn), tonumber(fp), tonumber(fy) end
         elseif line:sub(1, 2) == "V " then
             versionSeen = line:match("^V (%S+)")
+        elseif line:sub(1, 2) == "W " and not loopback then
+            local hex = line:match("^W (%x+)$")
+            if hex and hex ~= peer.nameHex then
+                peer.nameHex = hex
+                peer.name = TAG.unhex(hex)
+            end
         elseif line:sub(1, 2) == "M " then
             peer.model = line:match("^M (%w+)")
         elseif line:sub(1, 2) == "D " then
@@ -3096,7 +3403,13 @@ end
 -- writes a fresh save into a spare slot, the launchers copy that file across, and this game
 -- loads it. The joiner then appears in the host's world, next to them.
 
-local COOP_SLOT = 9   -- a slot the game's own menus never fill; both PCs use the same number
+-- The game has 13 save slots, numbers 0 to 12: three for its autosaves, ten for save points.
+-- Its save and load lists show exactly those, and "Continue" picks among them. A slot number
+-- beyond that range can still be saved to and loaded from, and none of the game's own menus
+-- ever looks at it, so that is where the co-op save lives. (Up to 0.21 it was slot 9: one of
+-- the player's ten, shown at the top of their load list as an entry without a location,
+-- because a save made outside a save point has none.)
+local COOP_SLOT = 40
 local REQUEST_FILE = DIR .. "\\request.txt"       -- us -> our launcher: "getsave"
 local READY_FILE = DIR .. "\\save_ready.txt"      -- our launcher -> us: "ok <slot>" or "err <why>"
 local SAVED_FILE = DIR .. "\\coopsave_done.txt"   -- host game -> host launcher: "<slot>"
@@ -3113,9 +3426,7 @@ local MENU_LABELS = {
 local function coopSave(pawn)
     local st = gameStatics()
     if not st then return end
-    S.savingForPeer = true   -- this save is for the joiner; do not announce it as a normal save
     local ok, err = pcall(function() st:MakeFullSave(pawn:GetWorld(), COOP_SLOT, "Co-op", false, false) end)
-    S.savingForPeer = nil
     if ok then
         local f = io.open(SAVED_FILE, "w")
         if f then f:write(tostring(COOP_SLOT)) f:close() end
@@ -3350,6 +3661,8 @@ function LOAD.forget()
     S.deathSeen, S.msgText, S.msgUntil = nil, nil, nil
     S.trigQueue, S.trigPending, S.trigSent, S.trigInside, S.useQueue, S.usePending = {}, {}, {}, {}, {}, {}
     S.myEnemies, S.myHunted, S.myDoors, S.myPushing = nil, nil, nil, nil
+    S.tagText, S.tagSlot, S.tagShown, S.tagName = nil, nil, nil, nil   -- the HUD they were on is gone
+    S.ranged, S.clip = nil, nil
 end
 
 -- A load normally shows as a stretch without a player: the menu, a loading screen. A reload of
@@ -3370,16 +3683,59 @@ function LOAD.restarted(pawn)
     local wasWorld, wasClock = S.worldAddr, S.worldClock
     if world then S.worldAddr = world end
     if clock then S.worldClock = clock end
+    S.clockKnown = clock ~= nil
     if S.pawnGone then return false end   -- that load was seen the usual way
     if world and wasWorld and world ~= wasWorld then return true end
     if clock and wasClock and clock + 1.0 < wasClock then return true end
     return false
 end
 
+-- A load is about to take the level apart. Everything the mod has put into it (the other
+-- player's body with what it holds and its lights, our own stand-in body) is taken out first,
+-- by us, in an orderly way, and the mod then does nothing at all until the new level is up.
+-- Until 0.21 it carried on to the last moment: moving the body, swapping what it held and
+-- answering the other player's events while the game was already tearing the world down.
+-- Called when a save is picked in a menu and again when the engine starts replacing the map.
+function LOAD.leave(why)
+    if S.leaving then return end
+    S.leaving = os.clock()
+    log("a load is starting (" .. tostring(why) .. "); stepping out of the level until the new one is up")
+    local pawn = getPawn()
+    pcall(clearHeld)
+    pcall(destroyActor, S.avatar)
+    S.avatar, S.avatarComp, S.lightComp, S.muzzle, S.capsule = nil, nil, nil, nil, nil
+    S.muzzleFx, S.muzzleFxKind, S.akHold = nil, nil, nil
+    S.avatarVisible, S.lightVisible, S.collisionOn = nil, nil, nil
+    pcall(TAG.hide)
+    pcall(removeSelfBody, pawn)
+    S.selfModel = nil
+    pcall(hideMessage)
+end
+
+function LOAD.installHooks()
+    if S.leaveHooks then return end
+    S.leaveHooks = true
+    local function leaving(why)
+        return function()
+            local impl = SH2CoopMod.impl
+            if impl and impl.onLeaving then pcall(impl.onLeaving, why) end
+        end
+    end
+    local found = {}
+    if pcall(RegisterLoadMapPreHook, leaving("the map is being replaced")) then found[#found + 1] = "map load" end
+    for _, fn in ipairs({ "LoadSavedGame", "ContinueGame" }) do
+        if pcall(RegisterHook, "/Script/GameBase.MainMenuWidget:" .. fn, leaving("a save was chosen in the menu")) then
+            found[#found + 1] = fn
+        end
+    end
+    log("load hooks installed: " .. (#found > 0 and table.concat(found, ", ") or "none"))
+end
+
 -- ~30x a second, called by main.lua: measure ourselves and exchange messages.
 local function tick()
     pcall(runCmd)
     pcall(riskTick)
+    pcall(LOAD.installHooks)
     if S.restart then   -- runs with or without a player: after a death there may be none for a while
         local ok, err = pcall(restartTick)
         if not ok then warnOnce("restart:" .. tostring(err), "restart error: " .. tostring(err)) end
@@ -3407,6 +3763,26 @@ local function tick()
         pcall(riskTick, true)
         S.pawnGone = true
     end
+    if S.leaving then
+        if S.pawnGone then
+            S.leaving = nil   -- this is the new level
+        elseif os.clock() - S.leaving > 45 then
+            S.leaving = nil
+            log("the load that was starting never came; carrying on")
+        else
+            return   -- still the old level, about to go: keep out of it
+        end
+    end
+    -- After a load the game keeps its loading screen up until a key is pressed. The level is
+    -- there by then, but it stands still, with the loading film playing over it. Up to 0.21 the
+    -- mod went to work in that state already: built the other player's body, read their model
+    -- from disk, moved things. It now waits until the world is running, which shows in the
+    -- world's clock having moved on.
+    if S.pawnGone and S.clockKnown and (S.worldClock or 0) < 0.5 then
+        S.waitingSince = S.waitingSince or os.clock()
+        if os.clock() - S.waitingSince < 900 then return end
+    end
+    S.waitingSince = nil
 
     if S.pawnGone or not S.loadedAt then
         S.loadedAt = os.clock()
@@ -3416,7 +3792,6 @@ local function tick()
         local ok, err = pcall(onLoadedHere, pawn)
         if not ok then warnOnce("loaded:" .. tostring(err), "load sync error: " .. tostring(err)) end
     end
-    if on("sync_saves") then tryInstallSaveHooks() end
     if S.regroupAfterLoad then
         local now = os.clock()
         if now > S.regroupAfterLoad + 30 then
@@ -3475,7 +3850,13 @@ local function tick()
         S.muzzleOffAt = nil
         pcall(function() S.muzzle:SetIntensity(0) end)
     end
-    if on("show_peer_shots") then tryInstallShotHook() end
+    if on("show_peer_shots") then
+        tryInstallShotHook()
+        if peer.connected or S.mirror then
+            local okShot, errShot = pcall(SHOT.poll, pawn)
+            if not okShot then warnOnce("shotpoll:" .. tostring(errShot), "shot watch error: " .. tostring(errShot)) end
+        end
+    end
     if S.tickCount % 30 == 9 and os.clock() - (S.loadedAt or os.clock()) > 15 then
         local ok, err = pcall(ammoTick, pawn)
         if not ok then warnOnce("ammo:" .. tostring(err), "unlimited ammo error: " .. tostring(err)) end
@@ -3680,7 +4061,7 @@ local function tickAndDraw()
 end
 
 return { version = VERSION, tick = tickAndDraw, onKey = onKey, onFrame = onFrame, onMelee = onMeleeSwing,
-    onLocalSave = onLocalSave, onMenuClick = onMenuClick, onShot = onLocalShot,
-    onTrigger = onLocalTrigger, onUse = onLocalUse,
+    onMenuClick = onMenuClick, onShot = onLocalShot,
+    onTrigger = onLocalTrigger, onUse = onLocalUse, onLeaving = LOAD.leave,
     -- for tools\cmd probes: handle a line as if the other player had sent it
     debugEvent = function(text) local p = getPawn() if p then handleEvent(p, text) end end }
