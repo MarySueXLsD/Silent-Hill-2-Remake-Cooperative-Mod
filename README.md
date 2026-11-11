@@ -109,8 +109,10 @@ All tweaks apply immediately, also while the game is running.
 
 ## Play
 
-1. Get `CoopGhost.zip` (build it with `tools\build_dist.ps1`, see below), unzip it anywhere and
-   run `CoopLauncher.exe`.
+1. Download [`CoopGhost.zip` from the latest release](https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest/download/CoopGhost.zip),
+   unzip it anywhere and run `CoopLauncher.exe`. (Or build it yourself with
+   `tools\build_dist.ps1`, see below.) A step-by-step guide in Russian is in
+   [docs/INSTALL_RU.md](docs/INSTALL_RU.md) and inside the zip as `README_RU.txt`.
 2. Set the game folder (the one containing `SHProto.exe`) and press **Install / update mod** if
    the launcher says the mod is not installed. If the game is under Program Files the launcher
    offers to restart itself as administrator.
