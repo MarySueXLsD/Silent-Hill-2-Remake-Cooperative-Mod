@@ -63,10 +63,11 @@ found, and when it is solved the story moves on for both.
 - The mod is new. Played between two PCs so far: joining from the main menu with the host's save
   copied across, the shared inventory and pickups, doors, puzzles, watching cutscenes together,
   F7, and reconnecting after a drop.
-- Everything that came with 0.20 has only been checked on one PC, by feeding the mod the other
-  player's messages: story moments, dying together, following the host's loads, enemy deaths and
-  hit reactions, gunshots, pickup popups and unlimited ammo. It has not yet been played between
-  two PCs. Please report what breaks.
+- What came with 0.20 and 0.21 (story moments, dying together, following the host's loads,
+  enemy deaths and hit reactions, gunshots, pickup popups, unlimited ammo) has been checked on
+  one PC, by feeding the mod the other player's messages, and in one real session in which the
+  two players turned out to be on different versions of the mod. It has not yet been played
+  with both players on the same version. Please report what breaks.
 - Not shared yet: half-finished puzzle progress (one player does the puzzle), bosses, sliding
   doors opening and closing, item containers and elevators. Press **F7** to jump to the other
   player if something separates you.
@@ -81,7 +82,10 @@ found, and when it is solved the story moves on for both.
 - The mod keeps a crash guard: before it asks the game for something on the other player's
   behalf it leaves a note, and if the game goes down right after the same thing twice, that one
   thing is skipped for three days (see `ipc\skip.txt` in the mod folder; delete it to reset).
-- Both players need the same game build and the same version of the mod.
+- Both players need the same game build and the same version of the mod. Two different
+  versions connect and look fine while much of the mod does nothing, so this is checked: the
+  launcher updates the mod in the game folder before a session starts, and the launcher and the
+  game both say so when the two games run different versions.
 - Joining from the main menu copies the host's current save to the joiner. It goes into a spare
   save slot (number 9) that the game's own menus do not use; the joiner's own saves are left
   alone.
@@ -203,8 +207,12 @@ If the two games do not connect:
   traffic out through the wrong adapter. Close the ones you are not using.
 - Check that each player entered the *other* player's address, and that both use the same port.
 
-To update, both players download the new zip, unzip it over the old folder and press
-**Install / update mod** with the game closed. What changed in each version is listed on the
+To update, both players download the new zip, unzip it and start a session from the new
+launcher with the game closed: it updates the mod in the game folder first. (A new launcher is
+not yet a new mod. The game keeps running the old one until the launcher has replaced it, and
+with different versions on the two PCs most of the mod quietly does nothing. The launcher's log
+and a line on the game's screen tell you when that is the case.) What changed in each version
+is listed on the
 [releases page](https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod/releases).
 
 To uninstall, delete `dwmapi.dll` and the `ue4ss` folder from `<game>\SHProto\Binaries\Win64`.
@@ -286,6 +294,17 @@ agree, and where they cannot both be right, the host's game is the reference.
   the mod picks **Join co-op** itself, which copies the host's state over as above. A joiner
   who loads one of their own saves while the host is playing is taken into the host's game the
   same way.
+- **Noticing a load** is less obvious than it sounds. Most loads show as a stretch with no
+  player: the menu, a loading screen. A reload of the level you are already in, which is what
+  happens after a death, does not: the game is busy for the whole of it, and the next time the
+  mod looks there is a player again, a new one in a new world. So the mod asks the world
+  itself. A different world object, or the world's clock (which starts from zero in every
+  freshly loaded world) running backwards, means a load went by, and everything remembered
+  about the old level is dropped: the dead enemies, the taken pickups, the inventory count.
+- **Versions**: every packet names the version of the mod that wrote it. A newer mod sends
+  things an older one does not know and simply skips, so two different versions connect and
+  look fine while half of the mod does nothing. When the versions differ, the mod puts a line
+  on the screen and the launcher says so in its log and status.
 - **Dying together**: each game watches its own player's health. A death is sent as an event,
   and the other game puts a line of text on the game's own HUD, in the HUD's font. A few
   seconds later the host's game reloads its last save. The joiner's game returns to the main
