@@ -10,6 +10,17 @@ puzzle or triggers a cutscene the story moves on for both.
 > Unofficial fan project. Not affiliated with or endorsed by the game's developer or publisher.
 > You need your own copy of the game. This repository contains no game files.
 
+## Preview
+
+![Two players exploring together](docs/preview/two-players-lobby.webp)
+
+| | |
+|---|---|
+| ![The other player, seen from the front](docs/preview/two-players-front.webp) | ![Both players holding their weapons](docs/preview/held-weapons.webp) |
+| ![Playing as different characters, outdoors](docs/preview/characters-outdoors.webp) | ![Playing as different characters, indoors](docs/preview/characters-indoors.webp) |
+
+The launcher:
+
 ![Session page](docs/screenshots/session.png)
 
 ## What is shared
