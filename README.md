@@ -16,12 +16,9 @@ puzzle or triggers a cutscene the story moves on for both.
 
 | | |
 |---|---|
-| ![The other player, seen from the front](docs/preview/two-players-front.webp) | ![Both players holding their weapons](docs/preview/held-weapons.webp) |
-| ![Playing as different characters, outdoors](docs/preview/characters-outdoors.webp) | ![Playing as different characters, indoors](docs/preview/characters-indoors.webp) |
+| ![The other player, seen from the front](docs/preview/two-players-front.webp) | ![The other player, as Maria, running towards you](docs/preview/other-player-running.jpg) |
+| ![Playing as different characters, outdoors](docs/preview/characters-outdoors.webp) | ![The line "Other player died, restarting..." on the game's HUD](docs/preview/death-message.jpg) |
 
-| The other player, running over | When one of you dies, both restart |
-|---|---|
-| ![The other player, as Maria, running towards you](docs/preview/other-player-running.jpg) | ![The line "Other player died, restarting..." on the game's HUD](docs/preview/death-message.jpg) |
 
 Joining is one entry in the game's own main menu, **Join co-op**:
 
