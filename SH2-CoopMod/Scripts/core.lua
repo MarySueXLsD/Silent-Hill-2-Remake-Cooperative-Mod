@@ -25,7 +25,7 @@
 local ctx = ...
 local UEHelpers = ctx.UEHelpers
 local log = ctx.log
-local VERSION = "0.15"
+local VERSION = "0.16"
 
 local DIR = ctx.root .. "\\ipc"
 local OUT_FILE = DIR .. "\\out.txt"
@@ -1555,10 +1555,13 @@ end
 
 -- Called when our player is back after not existing for a while, i.e. a load just finished.
 local function onLoadedHere(pawn)
-    if not on("sync_saves") then return end
+    local viaMenu = S.joinedViaMenu   -- we just loaded the host's save from the main menu
+    S.joinedViaMenu = nil
     if S.role == "join" then
-        S.regroupAfterLoad = os.clock() + 3      -- stand beside the host once they are visible
-    elseif peer.connected and not S.mirror then
+        if viaMenu or on("sync_saves") then
+            S.regroupAfterLoad = os.clock() + 3  -- stand beside the host once they are visible
+        end
+    elseif on("sync_saves") and peer.connected and not S.mirror then
         enqueue("loaded")
         log("you loaded; the joiner's game will load too")
     end
@@ -2139,6 +2142,217 @@ local function runCmd()
     flush(true)
 end
 
+-- ================================================================ joining from the main menu
+
+-- The joiner gets an extra entry in the game's main menu. It is greyed out until the host is
+-- actually in the game. Pressing it asks the launcher for the host's save: the host's game
+-- writes a fresh save into a spare slot, the launchers copy that file across, and this game
+-- loads it. The joiner then appears in the host's world, next to them.
+
+local COOP_SLOT = 9   -- a slot the game's own menus never fill; both PCs use the same number
+local REQUEST_FILE = DIR .. "\\request.txt"       -- us -> our launcher: "getsave"
+local READY_FILE = DIR .. "\\save_ready.txt"      -- our launcher -> us: "ok <slot>" or "err <why>"
+local SAVED_FILE = DIR .. "\\coopsave_done.txt"   -- host game -> host launcher: "<slot>"
+
+local MENU_LABELS = {
+    join = { "Join co-op", "Совместная игра" },
+    wait = { "Join co-op (waiting for host)", "Совместная игра (ждём хоста)" },
+    busy = { "Joining...", "Подключение..." },
+    fail = { "Could not join, try again", "Не получилось, попробуй ещё раз" },
+}
+
+-- Host, in game: the launcher asked for a save the joiner can load.
+local function coopSave(pawn)
+    local st = gameStatics()
+    if not st then return end
+    S.savingForPeer = true   -- this save is for the joiner; do not announce it as a normal save
+    local ok, err = pcall(function() st:MakeFullSave(pawn:GetWorld(), COOP_SLOT, "Co-op", false, false) end)
+    S.savingForPeer = nil
+    if ok then
+        local f = io.open(SAVED_FILE, "w")
+        if f then f:write(tostring(COOP_SLOT)) f:close() end
+        log("saved for the joiner (slot " .. COOP_SLOT .. ")")
+    else
+        log("could not save for the joiner: " .. tostring(err))
+    end
+end
+
+local MENU_ENTRY = "JoinCoop_but"
+local BUTTON_EVENTS = { "OnClicked", "OnPressed", "OnReleased", "OnHovered", "OnUnhovered", "OnFocused", "OnUnfocused",
+    "OnKeyDownEvent", "OnKeyUpEvent" }
+-- Lua cannot be a click handler itself. So the entry's click is wired to a harmless function
+-- that every menu button has, and we listen for that function being called on our entry.
+local CLICK_FUNCTION = "ResetScrollState"
+
+local function onMenuClick(widget)
+    local btn = S.menuBtn
+    if btn and btn:IsValid() and widget and widget:IsValid() and widget:GetAddress() == btn:GetAddress() then
+        S.menuClicked = true   -- acted on by the next menu tick
+    end
+end
+
+local function tryInstallMenuClickHook()
+    if S.menuClickHook ~= nil then return end
+    S.menuClickHook = pcall(RegisterHook, "/Script/UCW.TextButton:" .. CLICK_FUNCTION, function(self)
+        local impl = SH2CoopMod.impl
+        if impl and impl.onMenuClick then pcall(impl.onMenuClick, self:get()) end
+    end)
+end
+
+local function createMenuButton(menu)
+    local template = menu.Load_but
+    if not (template and template:IsValid()) then return nil end
+    local list = template:GetParent()
+    if not (list and list:IsValid()) then return nil end
+
+    local btn
+    for i = 0, list:GetChildrenCount() - 1 do   -- still there from before a script reload?
+        local child = list:GetChildAt(i)
+        if child:IsValid() and child:GetFName():ToString() == MENU_ENTRY then btn = child end
+    end
+    if not btn then
+        -- An engine-made copy of the menu's own "Load game" entry: same font, colours, sounds, size.
+        btn = StaticConstructObject(template:GetClass(), template:GetOuter(), FName(MENU_ENTRY), 0, 0, false, false, template)
+        if not (btn and btn:IsValid()) then return nil end
+        -- The copy also inherited "open the load screen" as its click. That has to go before it is shown.
+        for _, name in ipairs(BUTTON_EVENTS) do pcall(function() btn[name]:Clear() end) end
+        local clean = false
+        pcall(function() clean = #btn.OnClicked:GetBindings() == 0 end)
+        if not clean then
+            S.menuBroken = true
+            log("could not prepare the co-op menu entry; the main menu is left as it is")
+            return nil
+        end
+        local slot = list:AddChild(btn)
+        pcall(function()
+            local src = template.Slot
+            slot:SetPadding(src.Padding)
+            slot:SetHorizontalAlignment(src.HorizontalAlignment)
+            slot:SetVerticalAlignment(src.VerticalAlignment)
+        end)
+        log("added the co-op entry to the main menu")
+    end
+
+    tryInstallMenuClickHook()
+    S.menuClickWired = S.menuClickHook and pcall(function()
+        btn.OnClicked:Clear()
+        btn.OnClicked:Add(btn, FName(CLICK_FUNCTION))
+    end)
+    if not S.menuClickWired then log("co-op menu entry: watching the button instead of its click event") end
+    S.menuRussian, S.menuLabel, S.menuEnabled, S.menuPressed, S.menuClicked = nil, nil, nil, false, nil
+    return btn
+end
+
+local function setMenuButton(key, enabled)
+    local btn = S.menuBtn
+    if S.menuLabel ~= key then
+        S.menuLabel = key
+        local pair = MENU_LABELS[key]
+        pcall(function() btn:SetText(FText(S.menuRussian and pair[2] or pair[1])) end)
+    end
+    if S.menuEnabled ~= enabled then
+        S.menuEnabled = enabled
+        pcall(function() btn:SetIsEnabled(enabled) end)
+    end
+end
+
+-- Runs while there is no player, i.e. in the main menu and on loading screens.
+local function menuTick()
+    local now = os.clock()
+    S.menuTicks = (S.menuTicks or 0) + 1
+    if S.menuTicks % 30 == 1 then readRole() readConfig() end
+
+    if not (S.menu and S.menu:IsValid()) then
+        S.menuBtn = nil
+        if S.menuTicks % 15 ~= 2 then return end
+        S.menu = FindFirstOf("SHMainMenuWidget")
+        if not (S.menu and S.menu:IsValid()) then return end
+    end
+    if S.role ~= "join" then   -- the host starts or loads a game the normal way
+        if S.menuBtn and S.menuBtn:IsValid() then pcall(function() S.menuBtn:SetVisibility(1) end) end   -- 1 = collapsed
+        return
+    end
+    if not (S.menuBtn and S.menuBtn:IsValid()) then
+        if S.menuBroken then return end
+        S.menuBtn = createMenuButton(S.menu)
+        if not S.menuBtn then return end
+    end
+    pcall(function() S.menuBtn:SetVisibility(0) end)   -- 0 = visible
+
+    -- The label follows the game's language: Russian when the menu is in Russian, English for
+    -- every other language. Checked again now and then, since the language can be changed in
+    -- the settings without leaving the menu.
+    if S.menuRussian == nil or S.menuTicks % 30 == 3 then
+        local russian = false
+        pcall(function() russian = S.menu.Load_but:GetText():ToString():find("[\208\209]") ~= nil end)
+        if russian ~= S.menuRussian then S.menuRussian, S.menuLabel = russian, nil end
+    end
+
+    -- Is the host in the game? Their game only sends while they are, so fresh packets mean yes.
+    local f = io.open(IN_FILE, "r")
+    if f then
+        local seq = (f:read("l") or ""):match("^S %x+ (%d+)")
+        f:close()
+        if seq and seq ~= S.menuHostSeq then
+            if S.menuHostSeq ~= nil then S.menuHostTime = now end   -- the first look only sets the baseline
+            S.menuHostSeq = seq
+        end
+    end
+    local hostInGame = S.menuHostTime ~= nil and now - S.menuHostTime < 3
+
+    if S.join then
+        -- waiting for our launcher to fetch the host's save
+        local r = io.open(READY_FILE, "r")
+        local answer = r and r:read("a") or nil
+        if r then r:close() os.remove(READY_FILE) end
+        local slot = answer and answer:match("^ok (%d+)")
+        if slot then
+            S.join = nil
+            log("host's save received; loading it")
+            setMenuButton("busy", false)
+            S.joinedViaMenu = true
+            pcall(function() S.menu:LoadSavedGame(tonumber(slot), nil, 0) end)
+            return
+        elseif answer or now - S.join > 40 then
+            S.join = nil
+            S.joinFailedUntil = now + 4
+            log("could not get the host's save: " .. (answer and (answer:match("^err%s+(.-)%s*$") or answer) or "no answer from the launcher"))
+        else
+            setMenuButton("busy", false)
+            return
+        end
+    end
+
+    if S.joinFailedUntil and now < S.joinFailedUntil then
+        setMenuButton("fail", false)
+    elseif hostInGame then
+        setMenuButton("join", true)
+    else
+        setMenuButton("wait", false)
+    end
+
+    -- A click arrives through the hook; without it, notice the button going down (30 looks a second).
+    local pressed = false
+    if not S.menuClickWired then pcall(function() pressed = S.menuBtn:IsPressed() end) end
+    local clicked = S.menuClicked or (pressed and not S.menuPressed)
+    S.menuClicked = nil
+    if clicked and S.menuEnabled then
+        os.remove(READY_FILE)
+        local q = io.open(REQUEST_FILE, "w")
+        if q then
+            q:write("getsave")
+            q:close()
+            S.join = now
+            setMenuButton("busy", false)
+            log("asked the launcher for the host's save")
+        else
+            S.joinFailedUntil = now + 4
+            log("could not ask the launcher for the host's save")
+        end
+    end
+    S.menuPressed = pressed
+end
+
 -- ================================================================ entry points
 
 -- ~30x a second, called by main.lua: measure ourselves and exchange messages.
@@ -2157,8 +2371,11 @@ local function tick()
         S.puzzleState, S.solvedRemote, S.puzzleSeen, S.puzzleSince = {}, {}, nil, nil
         S.pushables, S.pushState, S.pushRemote, S.pushSeen = {}, {}, {}, nil
         S.pawnGone = true   -- menu, loading screen or death: the next time we exist, a load has finished
+        local okMenu, errMenu = pcall(menuTick)
+        if not okMenu then warnOnce("menu:" .. tostring(errMenu), "main menu error: " .. tostring(errMenu)) end
         return
     end
+    S.menu, S.menuBtn, S.join = nil, nil, nil   -- in game now; the menu widget is gone
     -- While a save is loading the pawn exists before its parts do; wait until it is whole.
     local whole = pcall(function() assert(pawn.Mesh:IsValid() and pawn.Items:IsValid() and pawn.Health:IsValid()) end)
     if not whole then return end
@@ -2255,7 +2472,15 @@ local function tick()
 
     -- "go to the other player": F7, or the launcher's button
     tryInstallRegroupKey()
-    if S.tickCount % 30 == 17 and readLauncherCommand() == "regroup" then S.regroupRequested = true end
+    if S.tickCount % 10 == 7 then
+        local word = readLauncherCommand()
+        if word == "regroup" then
+            S.regroupRequested = true
+        elseif word == "coopsave" then
+            local ok, err = pcall(coopSave, pawn)
+            if not ok then log("could not save for the joiner: " .. tostring(err)) end
+        end
+    end
     if S.regroupRequested then
         S.regroupRequested = nil
         local ok, err = pcall(regroupNow, pawn)
@@ -2385,4 +2610,4 @@ local function tickAndDraw()
 end
 
 return { version = VERSION, tick = tickAndDraw, onKey = onKey, onFrame = onFrame, onMelee = onMeleeSwing,
-    onLocalSave = onLocalSave }
+    onLocalSave = onLocalSave, onMenuClick = onMenuClick }

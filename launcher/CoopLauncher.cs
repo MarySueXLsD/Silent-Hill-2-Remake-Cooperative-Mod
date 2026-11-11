@@ -1,9 +1,13 @@
 // SH2-CoopMod launcher - authored by MarySue.
 // Host or join a session, pick the game folder, change co-op tweaks and characters, pick a theme.
-// Also carries the mod's messages between the two PCs over UDP.
+// Also carries the mod's messages between the two PCs over UDP, and the host's save to a player
+// who joins from the game's main menu over TCP (same port number).
 //
 // Build: tools\build_dist.ps1 (uses the C# compiler that ships with Windows, so C# 5 syntax only).
 // Screenshots for the README: CoopLauncher.exe --screenshots <folder> [--scale 1.25]
+// Testing: CoopLauncher.exe --session <host|join>,<peer ip>[,<port>] starts a session at once, off
+// screen, without touching the saved settings; --save-into <folder> puts a fetched save and a
+// launcher.log there instead of in the game's save folder.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -40,6 +44,8 @@ namespace SH2CoopMod
             {
                 if (args[i] == "--screenshots") shotDir = args[i + 1];
                 if (args[i] == "--scale") float.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out forcedScale);
+                if (args[i] == "--session") MainForm.TestSession = args[i + 1];
+                if (args[i] == "--save-into") MainForm.TestSaveDir = args[i + 1];
             }
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) Theme.Scale = g.DpiX / 96f;
             if (forcedScale > 0.5f) Theme.Scale = forcedScale;
@@ -501,7 +507,7 @@ namespace SH2CoopMod
 
     class MainForm : Form
     {
-        const string Version = "0.15";
+        const string Version = "0.16";
         const string Author = "MarySue";
         const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
@@ -546,8 +552,14 @@ namespace SH2CoopMod
         volatile bool relayRun;
         int sentCount, recvCount;
         long lastRecvTicks;
+        TcpListener saveListener;
+        volatile bool fetching;
+
+        public static string TestSession, TestSaveDir;   // see the top of this file
 
         static int D(int v) { return Theme.D(v); }
+
+        protected override bool ShowWithoutActivation { get { return TestSession != null; } }
 
         protected override CreateParams CreateParams
         {
@@ -601,6 +613,18 @@ namespace SH2CoopMod
             BuildAboutPage(pages[5]);
 
             LoadSettings(ini);
+            if (!demo && TestSession != null)
+            {
+                string[] t = TestSession.Split(',');
+                SetRole(t[0] == "join");
+                if (t.Length > 1) ipBox.Value = t[1];
+                if (t.Length > 2) portBox.Value = t[2];
+                launchGame.Checked = false;
+                StartPosition = FormStartPosition.Manual;
+                Location = new Point(-30000, -30000);
+                ShowInTaskbar = false;
+                Shown += delegate { StartSession(); };
+            }
             loading = false;
             ApplyThemeAll();
             UpdateEnabled();
@@ -996,7 +1020,7 @@ namespace SH2CoopMod
             netStatus.Text = "Connected   (sent 30/s, received 30/s)"; netStatus.SetRole(Role.Good);
             sideStatus.Text = "\u25CF  Connected"; sideStatus.SetRole(Role.Good);
             startBtn.Enabled = false; stopBtn.Enabled = true;
-            logBox.Text = "21:04:11  Hosting for 26.91.33.150 on UDP port 47777.\r\n21:04:11  If Windows Firewall asks, allow this app on private networks.\r\n21:04:12  Game started. Load the same save as the other player.\r\n21:05:02  Other player connected.";
+            logBox.Text = "21:04:11  Hosting for 26.91.33.150 on port 47777.\r\n21:04:11  If Windows Firewall asks, allow this app on private networks.\r\n21:04:11  Load your save. The other player joins from their main menu.\r\n21:05:02  The other player is joining from their main menu. Saving the game for them.\r\n21:05:02  Save sent (275 KB).";
         }
 
         // ------------------------------------------------------------ log, paths
@@ -1005,6 +1029,7 @@ namespace SH2CoopMod
         {
             if (IsDisposed) return;
             if (InvokeRequired) { try { BeginInvoke(new Action<string>(Log), s); } catch { } return; }
+            if (TestSaveDir != null) { try { File.AppendAllText(Path.Combine(TestSaveDir, "launcher.log"), s + "\r\n"); } catch { } }
             logBox.AppendText((logBox.TextLength > 0 ? "\r\n" : "") + DateTime.Now.ToString("HH:mm:ss") + "  " + s);
         }
 
@@ -1104,7 +1129,7 @@ namespace SH2CoopMod
 
         void SaveAll()
         {
-            if (loading || demo) return;
+            if (loading || demo || TestSession != null) return;
             try
             {
                 StringBuilder sb = new StringBuilder();
@@ -1249,8 +1274,11 @@ namespace SH2CoopMod
             {
                 Directory.CreateDirectory(IpcDir);
                 File.WriteAllText(Path.Combine(IpcDir, "role.txt"), join ? "join" : "host");
-                string inFile = Path.Combine(IpcDir, "in.txt");
-                if (File.Exists(inFile)) File.Delete(inFile);
+                foreach (string stale in new string[] { "in.txt", "request.txt", "save_ready.txt", "coopsave_done.txt" })
+                {
+                    string path = Path.Combine(IpcDir, stale);
+                    if (File.Exists(path)) File.Delete(path);
+                }
             }
             catch (UnauthorizedAccessException) { OfferElevation("The launcher cannot write to the mod folder inside the game."); return; }
             catch (Exception ex) { Log("Cannot prepare the mod folder: " + ex.Message); return; }
@@ -1269,8 +1297,25 @@ namespace SH2CoopMod
             relayThread.IsBackground = true;
             relayThread.Start();
             startBtn.Enabled = false; stopBtn.Enabled = true;
-            Log((join ? "Joining " : "Hosting for ") + peer + " on UDP port " + port + ".");
+            Log((join ? "Joining " : "Hosting for ") + peer + " on port " + port + ".");
             Log("If Windows Firewall asks, allow this app on private networks.");
+
+            // The host hands its save to a player who joins from the game's main menu.
+            if (!join || IPAddress.IsLoopback(peer))
+            {
+                try
+                {
+                    TcpListener tcp = new TcpListener(IPAddress.Any, port);
+                    tcp.Start();
+                    saveListener = tcp;
+                    Thread st = new Thread(delegate() { SaveServerLoop(tcp, peer, ipc); });
+                    st.IsBackground = true;
+                    st.Start();
+                }
+                catch (Exception ex) { Log("Cannot open TCP port " + port + " (" + ex.Message + "). The other player cannot join from the main menu."); }
+            }
+            Log(join ? "When the host is in the game, choose \"Join co-op\" in the game's main menu."
+                     : "Load your save. The other player joins from their main menu.");
 
             if (launchGame.Checked && !GameRunning)
             {
@@ -1279,7 +1324,7 @@ namespace SH2CoopMod
                     ProcessStartInfo psi = new ProcessStartInfo(Path.Combine(GamePath, "SHProto.exe"));
                     psi.WorkingDirectory = GamePath; psi.UseShellExecute = true;
                     Process.Start(psi);
-                    Log("Game started. Load the same save as the other player.");
+                    Log("Game started.");
                 }
                 catch (Exception ex) { Log("Could not start the game: " + ex.Message); }
             }
@@ -1288,6 +1333,8 @@ namespace SH2CoopMod
         void StopSession()
         {
             relayRun = false;
+            TcpListener l = saveListener; saveListener = null;
+            if (l != null) { try { l.Stop(); } catch { } }
             Thread t = relayThread; relayThread = null;
             if (t != null) t.Join(1000);
             if (!IsDisposed && startBtn != null) { startBtn.Enabled = true; stopBtn.Enabled = false; }
@@ -1298,12 +1345,28 @@ namespace SH2CoopMod
         {
             string outFile = Path.Combine(ipc, "out.txt");
             string inFile = Path.Combine(ipc, "in.txt");
+            string requestFile = Path.Combine(ipc, "request.txt");
             string lastSent = "";
             Encoding enc = Encoding.ASCII;
+            int loops = 0;
             try
             {
                 while (relayRun)
                 {
+                    // The mod's "Join co-op" menu entry asks for the host's save by dropping this file.
+                    if (++loops % 10 == 0 && !fetching && File.Exists(requestFile))
+                    {
+                        bool taken = false;
+                        try { File.Delete(requestFile); taken = true; }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                        if (taken)
+                        {
+                            fetching = true;
+                            ThreadPool.QueueUserWorkItem(delegate { FetchSave(peer, ipc); });
+                        }
+                    }
+
                     try
                     {
                         string text;
@@ -1345,6 +1408,179 @@ namespace SH2CoopMod
             }
             catch (Exception ex) { Log("Relay stopped: " + ex.Message); }
             finally { try { udp.Close(); } catch { } }
+        }
+
+        // ------------------------------------------------------------ joining from the main menu
+        //
+        // The joiner's mod drops request.txt -> this launcher asks the host's launcher over TCP ->
+        // that one tells its game to save (command.txt "coopsave", answered by coopsave_done.txt)
+        // and sends the file back -> it lands in the joiner's co-op slot -> save_ready.txt tells
+        // the joiner's mod to load it.
+
+        const int CoopSlot = 9;                          // the mod uses the same number; never one of the player's own slots
+        const int MaxSaveBytes = 64 * 1024 * 1024;
+
+        // The game keeps saves in a folder named after the account; take the one in use.
+        static string FindSaveDir()
+        {
+            string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"SilentHill2\Saved\SaveGames");
+            if (!Directory.Exists(root)) return null;
+            string best = null;
+            DateTime bestTime = DateTime.MinValue;
+            foreach (string d in Directory.GetDirectories(root))
+            {
+                foreach (string f in Directory.GetFiles(d, "*.sav"))
+                {
+                    DateTime t = File.GetLastWriteTimeUtc(f);
+                    if (t > bestTime) { bestTime = t; best = d; }
+                }
+            }
+            return best;
+        }
+
+        static string ReadLine(Stream s, int max)
+        {
+            StringBuilder sb = new StringBuilder();
+            while (sb.Length < max)
+            {
+                int b = s.ReadByte();
+                if (b < 0 || b == '\n') break;
+                if (b != '\r') sb.Append((char)b);
+            }
+            return sb.ToString();
+        }
+
+        // Host: answer the joiner's launcher, and nobody else.
+        void SaveServerLoop(TcpListener tcp, IPAddress peer, string ipc)
+        {
+            while (relayRun)
+            {
+                TcpClient c;
+                try { c = tcp.AcceptTcpClient(); }
+                catch { break; }   // the session was stopped
+                try
+                {
+                    using (c)
+                    {
+                        if (!((IPEndPoint)c.Client.RemoteEndPoint).Address.Equals(peer)) continue;
+                        c.ReceiveTimeout = 5000; c.SendTimeout = 30000;
+                        NetworkStream ns = c.GetStream();
+                        if (ReadLine(ns, 32) != "GETSAVE") continue;
+                        Log("The other player is joining from their main menu. Saving the game for them.");
+                        byte[] data;
+                        string err = MakeSaveForPeer(ipc, out data);
+                        byte[] head = Encoding.ASCII.GetBytes(err == null ? "OK " + data.Length + "\n" : "ERR " + err + "\n");
+                        ns.Write(head, 0, head.Length);
+                        if (err == null) { ns.Write(data, 0, data.Length); Log("Save sent (" + (data.Length / 1024) + " KB)."); }
+                        else Log("No save sent: " + err);
+                    }
+                }
+                catch (Exception ex) { Log("Could not send the save: " + ex.Message); }
+            }
+        }
+
+        // Host: have the game write a fresh save into the co-op slot and read it. Returns what went wrong, or null.
+        string MakeSaveForPeer(string ipc, out byte[] data)
+        {
+            data = null;
+            if (!GameRunning) return "the host's game is not running";
+            string done = Path.Combine(ipc, "coopsave_done.txt");
+            string command = Path.Combine(ipc, "command.txt");
+            try { File.Delete(done); } catch (IOException) { }
+            DateTime asked = DateTime.UtcNow;
+            File.WriteAllText(command, "coopsave");
+
+            string slotText = "";
+            for (int i = 0; i < 150 && relayRun && slotText.Length == 0; i++)   // the mod looks three times a second
+            {
+                Thread.Sleep(100);
+                try { if (File.Exists(done)) slotText = File.ReadAllText(done).Trim(); } catch (IOException) { }
+            }
+            int slot;
+            if (slotText.Length == 0)
+            {
+                try { File.Delete(command); } catch (IOException) { }
+                return "the host is not in the game";
+            }
+            if (!int.TryParse(slotText, out slot) || slot < 0 || slot > 99) return "the host's mod gave a bad answer";
+
+            string dir = FindSaveDir();
+            if (dir == null) return "the host's save folder was not found";
+            string file = Path.Combine(dir, "SaveGameData_" + slot + ".sav");
+            long size = -1;
+            bool settled = false;
+            for (int i = 0; i < 50 && !settled; i++)   // fresh, and no longer growing
+            {
+                FileInfo fi = new FileInfo(file);
+                if (fi.Exists && fi.Length > 0 && fi.LastWriteTimeUtc >= asked.AddSeconds(-2))
+                {
+                    if (fi.Length == size) settled = true;
+                    size = fi.Length;
+                }
+                if (!settled) Thread.Sleep(100);
+            }
+            if (!settled) return "the host's game could not save just now, try again in a moment";
+            if (size > MaxSaveBytes) return "the save is too large";
+            using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                byte[] buf = new byte[(int)fs.Length];
+                int got = 0;
+                while (got < buf.Length)
+                {
+                    int n = fs.Read(buf, got, buf.Length - got);
+                    if (n <= 0) break;
+                    got += n;
+                }
+                if (got != buf.Length) return "the save could not be read";
+                data = buf;
+            }
+            return null;
+        }
+
+        // Joiner: get the host's save, put it into the co-op slot, tell the mod.
+        void FetchSave(IPEndPoint peer, string ipc)
+        {
+            string answer;
+            try
+            {
+                Log("Asking the host for their save...");
+                byte[] data;
+                using (TcpClient c = new TcpClient())
+                {
+                    IAsyncResult ar = c.BeginConnect(peer.Address, peer.Port, null, null);
+                    if (!ar.AsyncWaitHandle.WaitOne(6000)) throw new Exception("the host's launcher did not answer (is it running, and is its firewall open?)");
+                    c.EndConnect(ar);
+                    c.ReceiveTimeout = 30000; c.SendTimeout = 5000;
+                    NetworkStream ns = c.GetStream();
+                    byte[] ask = Encoding.ASCII.GetBytes("GETSAVE\n");
+                    ns.Write(ask, 0, ask.Length);
+                    string head = ReadLine(ns, 200);
+                    if (head.StartsWith("ERR ")) throw new Exception(head.Substring(4));
+                    int len;
+                    if (!head.StartsWith("OK ") || !int.TryParse(head.Substring(3), out len) || len <= 0 || len > MaxSaveBytes)
+                        throw new Exception("the host's launcher gave a bad answer (is it the same version?)");
+                    data = new byte[len];
+                    int got = 0;
+                    while (got < len)
+                    {
+                        int n = ns.Read(data, got, len - got);
+                        if (n <= 0) throw new Exception("the connection dropped while the save was coming in");
+                        got += n;
+                    }
+                }
+                string dir = TestSaveDir != null ? TestSaveDir : FindSaveDir();
+                if (dir == null) throw new Exception("this PC's save folder was not found (start the game once first)");
+                File.WriteAllBytes(Path.Combine(dir, "SaveGameData_" + CoopSlot + ".sav"), data);
+                answer = "ok " + CoopSlot;
+                Log("Host's save received (" + (data.Length / 1024) + " KB). The game is loading it.");
+            }
+            catch (Exception ex)
+            {
+                answer = "err " + ex.Message;
+                Log("Could not get the host's save: " + ex.Message);
+            }
+            try { File.WriteAllText(Path.Combine(ipc, "save_ready.txt"), answer); } catch { }
+            fetching = false;
         }
 
         void UpdateNetStatus()

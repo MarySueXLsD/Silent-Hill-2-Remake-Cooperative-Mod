@@ -19,6 +19,17 @@ puzzle or triggers a cutscene the story moves on for both.
 | ![The other player, seen from the front](docs/preview/two-players-front.webp) | ![Both players holding their weapons](docs/preview/held-weapons.webp) |
 | ![Playing as different characters, outdoors](docs/preview/characters-outdoors.webp) | ![Playing as different characters, indoors](docs/preview/characters-indoors.webp) |
 
+Joining is one entry in the game's own main menu, **Join co-op**:
+
+![The Join co-op entry in the game's main menu](docs/preview/join-coop-menu.jpg)
+
+| Host not in the game yet | Host in the game |
+|---|---|
+| ![Join co-op, greyed out while waiting for the host](docs/preview/join-coop-waiting.jpg) | ![Join co-op, ready to pick](docs/preview/join-coop-ready.jpg) |
+
+The entry is labelled in English, or in Russian («Совместная игра») when the game is set to
+Russian.
+
 The launcher:
 
 ![Session page](docs/screenshots/session.png)
@@ -35,6 +46,7 @@ The launcher:
 | **Pushable objects** | Furniture one player pushes moves for both |
 | **Cutscenes** | Both players watch together, then carry on side by side where the host is |
 | **Enemies** | Same health and deaths for both, and they hunt whichever player is closer |
+| **Joining** | The joiner picks **Join co-op** in the game's main menu and loads straight into the host's game, beside them. No need to have the same save |
 | **Saving and loading** | The joiner saves when the host saves, and loads when the host loads |
 | **Characters** | Play as James, Maria, Angela or Mary, for the other player and on your own screen |
 
@@ -52,7 +64,10 @@ found, and when it is solved the story moves on for both.
   scripted groups and bosses, sliding doors opening and closing, plain switches, item
   containers and elevators. Press **F7** to jump to the other player if something separates you.
 - If the host deliberately loads an older save slot, the joiner gets their own latest save.
-- Both players need the same game build and should start from the same point in the game.
+- Both players need the same game build and the same version of the mod.
+- Joining from the main menu copies the host's current save to the joiner. It goes into a spare
+  save slot (number 9) that the game's own menus do not use; the joiner's own saves are left
+  alone. It has been tested on one PC against a stand-in host, not yet between two PCs.
 
 ## The launcher
 
@@ -109,7 +124,7 @@ All tweaks apply immediately, also while the game is running.
 ## Requirements
 
 - Windows, and the PC version of the game. Built and tested on game build 1.0.0.5.
-- Both players on the same game build, starting from the same save in the same area.
+- Both players on the same game build and the same version of the mod.
 - A network where the two PCs can reach each other by IP: Radmin VPN, Hamachi or LAN.
 - [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) (experimental build), which loads the mod.
   The packaged release bundles it; from source you install it yourself.
@@ -125,8 +140,15 @@ All tweaks apply immediately, also while the game is running.
    offers to restart itself as administrator.
 3. One player picks **Host**, the other **Join**. Each enters the *other* player's address. The
    launcher lists your own addresses; click one to copy it.
-4. Press **Start session**. Allow the launcher through Windows Firewall if asked (UDP 47777).
-5. Both load the same save. The status turns green when packets arrive from the other player.
+4. Press **Start session**. Allow the launcher through Windows Firewall if asked (UDP and TCP
+   47777).
+5. The host loads a save or starts a new game, as usual.
+6. The joiner stays in the game's main menu. It has a new entry at the bottom, **Join co-op**,
+   greyed out while the host is not in the game yet. Once it lights up, pick it: the host's game
+   saves, the save is copied across and loaded, and the joiner appears beside the host. The
+   status in the launcher turns green when packets arrive from the other player.
+
+Two players who already have the same save can also just load it on both PCs, as before.
 
 In game, **F9** toggles a solo test: the other player's body appears beside you and copies you.
 **F7** moves you to the other player, for when an elevator, a drop or anything unsynced
@@ -142,6 +164,8 @@ The game ships without any networking, and Lua inside UE4SS has no sockets, so t
  game A  <-- files -->  launcher A  <== UDP over VPN ==>  launcher B  <-- files -->  game B
  (mod)       ipc\                                                          ipc\       (mod)
 ```
+
+(Plus one TCP connection when a player joins from the main menu, to carry the host's save.)
 
 - **The mod** (`SH2-CoopMod\Scripts\core.lua`) runs inside each game. About 30 times a second it
   measures the local player (position, 27 bone rotations, held items, flashlight) and writes
@@ -179,6 +203,14 @@ The game ships without any networking, and Lua inside UE4SS has no sockets, so t
   number when the host used one), and when the host loads or dies, the joiner reloads its own
   latest save and is placed beside the host. If the host deliberately loads an older slot, the
   joiner still gets its latest.
+- **Joining from the main menu**: while the joiner has no player yet, the mod adds an entry to
+  the main menu, an engine-made copy of the game's own "Load game" entry with its click
+  replaced. The host's game only sends packets while the host is in the game, so fresh packets
+  switch the entry on. Picking it drops a request file; the joiner's launcher asks the host's
+  launcher over TCP (same port number, and only the configured other player is answered); that
+  launcher tells its game to write a save into slot 9 and sends the file back; the joiner's
+  launcher stores it as its own slot 9, and the mod loads that slot with the menu's own
+  "load saved game" call. After loading, the joiner is placed beside the host.
 - **Enemies** run in both games; they come from the same spawners placed in the level, so a
   hash of the spawner's path names an enemy on both PCs. Animation, attacks and damage to the
   local player stay native. The mod makes the two copies agree: damage either player deals is
