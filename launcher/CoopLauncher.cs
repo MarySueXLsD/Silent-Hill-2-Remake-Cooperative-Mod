@@ -501,17 +501,19 @@ namespace CoopGhost
 
     class MainForm : Form
     {
-        const string Version = "0.8";
+        const string Version = "0.14";
         const string Author = "MarySue";
         const string RepoUrl = "https://github.com/MarySueXLsD/SH2CoopGhost";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
 
-        static readonly string[] ModelKeys = { "james", "maria", "angela", "eddie", "mary" };
-        static readonly string[] ModelNames = { "James", "Maria", "Angela", "Eddie", "Mary" };
-        static readonly string[] PageNames = { "Session", "Tweaks", "Characters", "Appearance", "About" };
+        static readonly string[] ModelKeys = { "james", "maria", "angela", "mary" };
+        static readonly string[] ModelNames = { "James", "Maria", "Angela", "Mary" };
+        static readonly string[] PageNames = { "Session", "Tweaks", "World", "Characters", "Appearance", "About" };
         static readonly string[] ToggleKeys = { "share_inventory", "host_inventory_wins", "share_ammo", "share_healing", "share_documents",
-            "share_key_items", "show_other_player", "show_held_items", "sync_flashlight", "flashlight_shadows", "show_my_model_to_me" };
-        static readonly string[] ToggleDefaults = { "1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1" };
+            "share_key_items", "show_other_player", "show_held_items", "sync_flashlight", "flashlight_shadows", "show_my_model_to_me",
+            "sync_doors", "other_player_collision", "friendly_fire", "sync_cutscenes", "sync_enemies", "sync_puzzles", "sync_pushables",
+            "sync_saves" };
+        static readonly string[] ToggleDefaults = { "1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1", "1", "0", "0", "1", "1", "1", "1", "1" };
         static readonly int[] SendRates = { 30, 15, 10 };
 
         readonly bool demo;
@@ -564,7 +566,7 @@ namespace CoopGhost
             Text = "CoopGhost";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(D(940), D(680));
+            ClientSize = new Size(D(940), D(760));
             DoubleBuffered = true;
             Font = Theme.F(13f, false);
             using (Bitmap bmp = new Bitmap(64, 64))
@@ -586,16 +588,17 @@ namespace CoopGhost
             for (int i = 0; i < pages.Length; i++)
             {
                 Panel p = new Panel();
-                p.SetBounds(D(234), D(64), D(682), D(596));
+                p.SetBounds(D(234), D(64), D(682), D(676));
                 p.Visible = false;
                 Controls.Add(p);
                 pages[i] = p;
             }
             BuildSessionPage(pages[0]);
             BuildTweaksPage(pages[1]);
-            BuildCharactersPage(pages[2]);
-            BuildAppearancePage(pages[3]);
-            BuildAboutPage(pages[4]);
+            BuildWorldPage(pages[2]);
+            BuildCharactersPage(pages[3]);
+            BuildAppearancePage(pages[4]);
+            BuildAboutPage(pages[5]);
 
             LoadSettings(ini);
             loading = false;
@@ -772,6 +775,8 @@ namespace CoopGhost
             foreach (string k in new string[] { "host_inventory_wins", "share_ammo", "share_healing", "share_documents", "share_key_items" }) tg[k].Enabled = inv;
             bool other = tg["show_other_player"].Checked;
             tg["show_held_items"].Enabled = other; sl["other_player_scale"].Enabled = other;
+            tg["other_player_collision"].Enabled = other;
+            sl["ff_hit_damage"].Enabled = tg["friendly_fire"].Checked;
             bool fl = tg["sync_flashlight"].Checked;
             tg["flashlight_shadows"].Enabled = fl; sl["flashlight_brightness"].Enabled = fl;
             tg["show_my_model_to_me"].Enabled = myModel != 0;
@@ -808,13 +813,21 @@ namespace CoopGhost
             launchGame = new Toggle(); launchGame.Location = new Point(D(290), D(335)); p.Controls.Add(launchGame);
             launchGame.CheckedChanged += OnSettingChanged;
 
-            Card log = PutCard(p, "Log", 0, 380, 682, 216);
+            Btn regroup = PutBtn(p, "Go to other player (F7)", Kind.Ghost, 494, 324, 186, 44);
+            regroup.Click += delegate
+            {
+                // The mod picks this file up within a second and moves the player in game.
+                try { Directory.CreateDirectory(IpcDir); File.WriteAllText(Path.Combine(IpcDir, "command.txt"), "regroup"); Log("Asked the game to move you to the other player."); }
+                catch (Exception ex) { Log("Could not send that to the game: " + ex.Message); }
+            };
+
+            Card log = PutCard(p, "Log", 0, 380, 682, 296);
             netStatus = new Lbl("Not running", Role.Muted, 12f, false);
             netStatus.AutoSize = false; netStatus.TextAlign = ContentAlignment.TopRight;
             netStatus.SetBounds(D(226), D(12), D(440), D(18));
             log.Controls.Add(netStatus);
             logBox = new LogBox();
-            logBox.SetBounds(D(16), D(38), D(650), D(166));
+            logBox.SetBounds(D(16), D(38), D(650), D(246));
             log.Controls.Add(logBox);
 
             browse.Click += delegate
@@ -848,7 +861,7 @@ namespace CoopGhost
             PutToggle(inv, "share_documents", 16, 218, 303, "Maps, notes and photos", null);
             PutToggle(inv, "share_key_items", 16, 248, 303, "Weapons, keys and puzzle items", null);
 
-            Card net = PutCard(p, "Network", 0, 296, 335, 268);
+            Card net = PutCard(p, "Network", 0, 296, 335, 204);
             Put(net, "Updates sent per second", Role.Text, 13f, false, 16, 44);
             rateChips = new Btn[SendRates.Length];
             for (int i = 0; i < SendRates.Length; i++)
@@ -860,23 +873,40 @@ namespace CoopGhost
             }
             PutSlider(net, "interp_delay_ms", 16, 86, 303, "Smoothing delay", 0, 300, 10, " ms");
             PutSlider(net, "peer_timeout_s", 16, 142, 303, "Hide other player after silence", 1, 10, 1, " s");
-            PutWrapped(net, "More delay looks smoother on a poor connection, but the other player is shown further behind where they really are.",
-                Role.Muted, 11.5f, 16, 200, 303, 56);
 
-            Card other = PutCard(p, "Other player", 347, 0, 335, 196);
+            Card other = PutCard(p, "Other player", 347, 0, 335, 242);
             PutToggle(other, "show_other_player", 16, 40, 303, "Show the other player", "Draw their body in my world");
             PutToggle(other, "show_held_items", 16, 86, 303, "Held items", "Weapon, flashlight and radio on their body");
-            PutSlider(other, "other_player_scale", 16, 136, 303, "Size", 50, 150, 5, " %");
+            PutToggle(other, "other_player_collision", 16, 132, 303, "Collision", "Their body blocks me, and enemies too");
+            PutSlider(other, "other_player_scale", 16, 182, 303, "Size", 50, 150, 5, " %");
 
-            Card flash = PutCard(p, "Flashlight", 347, 208, 335, 196);
+            Card flash = PutCard(p, "Flashlight", 347, 254, 335, 196);
             PutToggle(flash, "sync_flashlight", 16, 40, 303, "Their flashlight lights my world", "A real beam, aimed where they aim");
             PutToggle(flash, "flashlight_shadows", 16, 86, 303, "Beam casts shadows", "Looks better, costs performance");
             PutSlider(flash, "flashlight_brightness", 16, 136, 303, "Beam brightness", 25, 300, 25, " %");
 
-            Card note = PutCard(p, null, 347, 416, 335, 148);
-            PutWrapped(note, "Tweaks apply straight away, also while the game is running. Health is never shared, and the map and item screens stay separate for each player.",
-                Role.Muted, 12f, 16, 16, 303, 60);
-            Put(note, "Both players should use the same sharing choices.", Role.Muted, 12f, false, 16, 86);
+        }
+
+        // Everything about the shared world: what both games keep in step.
+        void BuildWorldPage(Panel p)
+        {
+            Card world = PutCard(p, "Shared world", 0, 0, 335, 286);
+            PutToggle(world, "sync_puzzles", 16, 40, 303, "Puzzles", "Solved by one of us, solved for both");
+            PutToggle(world, "sync_doors", 16, 86, 303, "Doors", "Open, close and unlock for both players");
+            PutToggle(world, "sync_pushables", 16, 132, 303, "Pushable objects", "Furniture one of us pushes moves for both");
+            PutToggle(world, "sync_cutscenes", 16, 178, 303, "Cutscenes", "Watch together, then regroup at the host");
+            PutToggle(world, "sync_saves", 16, 224, 303, "Save and load together", "Joiner saves and loads when the host does");
+
+            Card combat = PutCard(p, "Combat", 347, 0, 335, 214);
+            PutToggle(combat, "sync_enemies", 16, 40, 303, "Shared enemies", "Same health and targets; they hunt both of us");
+            PutToggle(combat, "friendly_fire", 16, 86, 303, "Friendly fire", "My attacks hurt them; a shot counts double");
+            PutSlider(combat, "ff_hit_damage", 16, 136, 303, "Damage per melee hit", 5, 30, 1, " hp");
+
+            Card note = PutCard(p, null, 347, 226, 335, 136);
+            PutWrapped(note, "These apply straight away, also mid-game, and both players should use the same choices.",
+                Role.Muted, 12f, 16, 16, 303, 40);
+            PutWrapped(note, "Health is never shared. If you get separated, press F7 in game or use Go to other player on the Session page.",
+                Role.Muted, 12f, 16, 64, 303, 60);
         }
 
         void BuildCharactersPage(Panel p)
@@ -1047,6 +1077,7 @@ namespace CoopGhost
             sl["flashlight_brightness"].Value = GetInt(d, "flashlight_brightness", 100);
             sl["interp_delay_ms"].Value = GetInt(d, "interp_delay_ms", 100);
             sl["peer_timeout_s"].Value = GetInt(d, "peer_timeout_s", 3);
+            sl["ff_hit_damage"].Value = GetInt(d, "ff_hit_damage", 10);
             foreach (string k in sl.Keys) slValue[k].Text = sl[k].Value + slUnit[k];
             sendRate = GetInt(d, "send_rate_hz", 30);
             if (Array.IndexOf(SendRates, sendRate) < 0) sendRate = 30;
@@ -1349,12 +1380,13 @@ namespace CoopGhost
             Application.DoEvents();
             f.Shot(dir, "session", 0, "fog");
             f.Shot(dir, "tweaks", 1, "fog");
-            f.Shot(dir, "characters", 2, "fog");
-            f.Shot(dir, "appearance", 3, "fog");
-            f.Shot(dir, "about", 4, "fog");
+            f.Shot(dir, "world", 2, "fog");
+            f.Shot(dir, "characters", 3, "fog");
+            f.Shot(dir, "appearance", 4, "fog");
+            f.Shot(dir, "about", 5, "fog");
             f.Shot(dir, "session-rust", 0, "rust");
             f.Shot(dir, "tweaks-moss", 1, "moss");
-            f.Shot(dir, "characters-paper", 2, "paper");
+            f.Shot(dir, "characters-paper", 3, "paper");
             f.Close();
         }
 
@@ -1363,7 +1395,7 @@ namespace CoopGhost
             Theme.Cur = Theme.Find(theme);
             ApplyThemeAll();
             ShowPage(pageIndex);
-            if (pageIndex == 2) { myModel = 1; otherModel = 0; RefreshChoices(); UpdateEnabled(); }
+            if (pageIndex == 3) { myModel = 1; otherModel = 0; RefreshChoices(); UpdateEnabled(); }
             Application.DoEvents();
             using (Bitmap bmp = new Bitmap(Width, Height))
             {

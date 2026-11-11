@@ -25,7 +25,7 @@
 local ctx = ...
 local UEHelpers = ctx.UEHelpers
 local log = ctx.log
-local VERSION = "0.8"
+local VERSION = "0.14"
 
 local DIR = ctx.root .. "\\ipc"
 local OUT_FILE = DIR .. "\\out.txt"
@@ -80,6 +80,15 @@ local DEFAULTS = {
     share_healing = "1",        --   health drinks, syringes, ampoules
     share_documents = "1",      --   maps, notes, memos, photos
     share_key_items = "1",      --   weapons, keys, puzzle pieces, everything else
+    sync_doors = "1",           -- doors open, close and unlock for both players
+    sync_cutscenes = "1",       -- both watch each cutscene together, then regroup at the host
+    sync_enemies = "1",         -- enemies share health and targets, and follow the host's positions
+    sync_puzzles = "1",         -- a puzzle solved by one player is solved for both
+    sync_pushables = "1",       -- furniture one player pushes moves for both
+    sync_saves = "1",           -- the joiner saves when the host saves, and loads when the host loads
+    other_player_collision = "0", -- the other player's body blocks me (and enemies)
+    friendly_fire = "0",        -- my attacks hurt the other player (both must enable it)
+    ff_hit_damage = "10",       -- health lost per melee hit, my estimate of one enemy hit; a shot is double
     show_other_player = "1",    -- draw the other player at all
     other_player_scale = "100", -- their size on my screen, percent
     flashlight_brightness = "100", -- brightness of their beam on my screen, percent
@@ -96,7 +105,6 @@ local MODELS = {
     james = "/Game/Game/Characters/Humans/JamesSunderland/Mesh/JamesSunderland_2022_08_29.JamesSunderland_2022_08_29",
     maria = "/Game/Game/Characters/Humans/Maria/Meshes/Maria.Maria",
     angela = "/Game/Game/Characters/Humans/Angela/Meshes/Angela_rig.Angela_rig",
-    eddie = "/Game/Game/Characters/Humans/Eddie/Meshes/Eddie_SkeletalMesh_GamePlayOnly.Eddie_SkeletalMesh_GamePlayOnly",
     mary = "/Game/Game/Characters/Humans/Mary/Meshes/Mary_SkeletalMesh.Mary_SkeletalMesh",
 }
 
@@ -121,6 +129,10 @@ local function readConfig()
 end
 
 local function enqueue(text)
+    -- With nobody connected there is no one to acknowledge events; keep only the recent ones.
+    if not peer.connected then
+        while #S.outbox >= 64 do table.remove(S.outbox, 1) end
+    end
     S.outbox[#S.outbox + 1] = { id = S.nextEventId, text = text }
     S.nextEventId = S.nextEventId + 1
 end
@@ -231,8 +243,46 @@ local function onRemoteInvFull(pawn, list)
     log("inventory replaced with host's (" .. changed .. " differences)")
 end
 
+local onRemoteLock, onRemoteFriendlyFire, onRemoteCutscene, onRemoteTook, onRemoteEnemyDamage, onRemoteSolved, onRemotePush   -- defined further down
+local onRemoteSaved, onRemoteLoaded
+
 local function handleEvent(pawn, text)
     local kind, rest = text:match("^(%S+)%s*(.*)$")
+    if kind == "saved" then
+        onRemoteSaved(pawn, tonumber(rest:match("^(%-?%d+)$")) or -1)
+        return
+    elseif kind == "loaded" then
+        onRemoteLoaded(pawn)
+        return
+    elseif kind == "push" then
+        local id, x, y, z = rest:match("^(%x+) (%-?%d+) (%-?%d+) (%-?%d+)$")
+        if id and on("sync_pushables") then onRemotePush(id, tonumber(x), tonumber(y), tonumber(z)) end
+        return
+    elseif kind == "solved" then
+        local id = rest:match("^(%x+)$")
+        if id and on("sync_puzzles") then onRemoteSolved(id) end
+        return
+    elseif kind == "edmg" then
+        local id, amount = rest:match("^(%x+) (%d+)$")
+        if id then onRemoteEnemyDamage(pawn, id, tonumber(amount)) end
+        return
+    elseif kind == "cut" then
+        local id, x, y, z, yaw = rest:match("^(%x+) (%-?%d+) (%-?%d+) (%-?%d+) (%-?%d+)$")
+        if id then onRemoteCutscene(id, tonumber(x), tonumber(y), tonumber(z), tonumber(yaw)) end
+        return
+    elseif kind == "took" then
+        local id = rest:match("^(%x+)$")
+        if id and on("share_inventory") then onRemoteTook(id) end
+        return
+    elseif kind == "lock" then
+        local id, v = rest:match("^(%x+) (%d)$")
+        if id then onRemoteLock(id, v == "1") end
+        return
+    elseif kind == "ff" then
+        local how, amount, dx, dy = rest:match("^(%a+) (%d+) (%-?%d+) (%-?%d+)$")
+        if how then onRemoteFriendlyFire(pawn, how, tonumber(amount), tonumber(dx) / 100, tonumber(dy) / 100) end
+        return
+    end
     if (kind == "inv" or kind == "invfull") and not on("share_inventory") then
         return   -- acknowledged but ignored: this player keeps a separate inventory
     end
@@ -537,6 +587,10 @@ local function spawnAvatar(pawn)
     S.heldComps = {}
     S.heldApplied = nil
     S.lightComp = nil
+    S.capsule = nil
+    S.collisionOn = nil
+    S.avatarScale = nil
+    for _, st in pairs(S.enemyState or {}) do st.forced = nil end   -- they were after the old body
     log("avatar spawned: " .. actor:GetFullName())
     return actor
 end
@@ -700,15 +754,36 @@ local function ensureLight(pawn)
     end
     light:SetAbsolute(false, true, false)   -- we aim it in world space every frame
 
+    -- Values measured on the game's own flashlight; replaced by live ones when we carry one.
+    -- The falloff mode matters most: the game uses the exponent falloff, where an intensity of
+    -- 48 is bright. A fresh light defaults to inverse-squared falloff, where 48 is invisible.
     local intensity, inner, outer, radius = 48, 16, 30, 1200
+    local inverseSquared, exponent = false, 8.0
+    local sourceRadius, softRadius, volumetric, specular, fnFade = 3.0, 2.0, 0.5, 0.5, 1050
     local src = S.myFl and S.myFl:IsValid() and S.myFl.LightMain or nil
     if src and src:IsValid() then
         if src.Intensity > 1 then intensity = src.Intensity end
         inner, outer, radius = src.InnerConeAngle, src.OuterConeAngle, src.AttenuationRadius
+        pcall(function() inverseSquared = src.bUseInverseSquaredFalloff end)
+        pcall(function() exponent = src.LightFalloffExponent end)
+        pcall(function() sourceRadius, softRadius = src.SourceRadius, src.SoftSourceRadius end)
+        pcall(function() volumetric, specular = src.VolumetricScatteringIntensity, src.SpecularScale end)
+        pcall(function() fnFade = src.LightFunctionFadeDistance end)
         pcall(function() light:SetLightFunctionMaterial(src.LightFunctionMaterial) end)
+        pcall(function() light:SetLightFunctionScale(src.LightFunctionScale) end)
         pcall(function() light:SetIESTexture(src.IESTexture) end)
     end
     pcall(function() light:SetIntensityUnits(0) end)   -- unitless, like the game's own
+    pcall(function() light.bUseInverseSquaredFalloff = inverseSquared end)
+    -- A property write alone does not reach the renderer; these setters do, but only when the
+    -- value actually changes, hence the nudge on the first one.
+    pcall(function() light:SetLightFalloffExponent(exponent + 0.01) end)
+    pcall(function() light:SetLightFalloffExponent(exponent) end)
+    pcall(function() light:SetSourceRadius(sourceRadius) end)
+    pcall(function() light:SetSoftSourceRadius(softRadius) end)
+    pcall(function() light:SetVolumetricScatteringIntensity(volumetric) end)
+    pcall(function() light:SetSpecularScale(specular) end)
+    pcall(function() light:SetLightFunctionFadeDistance(fnFade) end)
     light:SetIntensity(intensity)
     S.lightBase = intensity
     S.lightBrightness = nil   -- makes the tick apply the brightness setting to this new light
@@ -792,7 +867,8 @@ local function frame()
     if not okSelf then warnOnce("self:" .. tostring(errSelf), "own model error: " .. tostring(errSelf)) end
 
     local now = os.clock()
-    if #S.snaps == 0 or (now - peer.lastTime) > staleSeconds() or not on("show_other_player") then
+    -- hidden when there is no news of them, when switched off, and while we watch a cutscene
+    if #S.snaps == 0 or (now - peer.lastTime) > staleSeconds() or not on("show_other_player") or S.cutPlaying then
         setAvatarVisible(false)
         return
     end
@@ -839,6 +915,1005 @@ local function frame()
     end
 end
 
+-- ================================================================ collision with the other player
+
+-- An invisible capsule on the avatar, the same size as our own, that blocks pawns only: us and
+-- enemies walk into it, while doors, bullets and the camera pass through.
+local function updateCollision(pawn)
+    local want = on("other_player_collision") and S.avatarVisible == true
+    if want == S.collisionOn and (not want or (S.capsule and S.capsule:IsValid())) then return end
+    if want then
+        if not (S.capsule and S.capsule:IsValid()) then
+            local cap = S.avatar:AddComponentByClass(StaticFindObject("/Script/Engine.CapsuleComponent"), true, IDENT, false)
+            if not cap or not cap:IsValid() then warnOnce("capsule", "could not create the collision capsule") return end
+            cap:SetMobility(2)
+            cap:K2_AttachToComponent(S.avatarComp, FName("None"), 2, 2, 2, false)
+            local radius, half = 40, 90
+            pcall(function()
+                radius = pawn.CapsuleComponent:GetScaledCapsuleRadius()
+                half = pawn.CapsuleComponent:GetScaledCapsuleHalfHeight()
+            end)
+            cap:SetCapsuleSize(radius, half, false)
+            cap:K2_SetRelativeLocation({ X = 0, Y = 0, Z = half }, false, {}, true)   -- the avatar's origin is at its feet
+            cap:SetCollisionObjectType(1)             -- world dynamic
+            cap:SetCollisionResponseToAllChannels(0)  -- ignore everything...
+            cap:SetCollisionResponseToChannel(2, 2)   -- ...except pawns, which it blocks
+            S.capsule = cap
+        end
+        S.avatar:SetActorEnableCollision(true)
+        S.capsule:SetCollisionEnabled(3)   -- query and physics
+    else
+        if S.capsule and S.capsule:IsValid() then S.capsule:SetCollisionEnabled(0) end
+        pcall(function() S.avatar:SetActorEnableCollision(false) end)
+    end
+    S.collisionOn = want
+    log("collision with the other player " .. (want and "on" or "off"))
+end
+
+-- ================================================================ doors
+
+-- Every door near either player is driven by exactly one game: the one whose player stands
+-- closer to it. That game lets the door behave normally (pushed open, auto-closing) and reports
+-- its angle; the other game moves its copy of the door to match. So when the other player walks
+-- through a door, it opens here too. Locks are synced as reliable events in both directions.
+--
+-- A door is identified by a hash of its level path and component name, which is the same on
+-- both PCs because doors are placed in the level, not spawned.
+
+local DOOR_RANGE = 1500      -- only doors this close to a player are handled (centimetres)
+local DOOR_TIE = 60          -- distances this close count as a tie; the host drives the door
+local DOOR_TOUCH = 120       -- the other player's body this close to a door leaf pushes it open
+local SETTLE_SECONDS = 6     -- how long a freshly loaded door or pickup is left alone
+S.doorState = S.doorState or {}       -- id -> { lock = bool, lastTarget = angle }
+S.pendingLocks = S.pendingLocks or {} -- id -> bool, for doors not loaded here yet
+S.doors = S.doors or {}               -- currently loaded doors: { id, comp, lock, x, y, z }
+
+local function hashName(s)   -- djb2, 32 bit
+    local h = 5381
+    for i = 1, #s do h = (h * 33 + s:byte(i)) & 0xFFFFFFFF end
+    return string.format("%08x", h)
+end
+
+local function scanDoors()
+    if not (S.doorMgr and S.doorMgr:IsValid()) then
+        S.doorMgr = FindFirstOf("SHDoorsManagerComponent")
+        if not (S.doorMgr and S.doorMgr:IsValid()) then S.doors = {} return end
+    end
+    local list, seen = {}, {}
+    local now = os.clock()
+    S.doorMgr.RegisteredDoorMovementComponents:ForEach(function(_, e)
+        local comp = e:get()
+        if comp and comp:IsValid() then
+            local owner = comp:GetOwner()
+            local path = owner:GetFullName():match("^%S+%s+(.+)$") or owner:GetFullName()
+            local id = hashName(path .. "." .. comp:GetFName():ToString())
+            local loc = owner:K2_GetActorLocation()
+            local door = { id = id, comp = comp, lock = comp.ManagedDoorLockComponent, x = loc.X, y = loc.Y, z = loc.Z }
+            -- Where the door leaf is when closed, and where it would be swung 30 degrees either
+            -- way: enough to tell which side of the door somebody stands on.
+            pcall(function()
+                local c0 = comp:GetDoorTraceLoc(comp.ClosedAngle)
+                local cp = comp:GetDoorTraceLoc(comp.ClosedAngle + 30)
+                local cn = comp:GetDoorTraceLoc(comp.ClosedAngle - 30)
+                door.leaf = { c0.X, c0.Y, c0.Z, cp.X, cp.Y, cn.X, cn.Y }
+            end)
+            list[#list + 1] = door
+
+            local st = S.doorState[id]
+            if not st then st = {} S.doorState[id] = st end
+            seen[id] = true
+            -- A door that has just streamed in is still being set up by the game (its saved lock
+            -- state is applied a moment after it appears). Those changes are not player actions,
+            -- so nothing is reported, or applied, until the door has been around for a while.
+            if not (S.doorSeen and S.doorSeen[id]) then st.since = now end
+            local settled = now - (st.since or now) >= SETTLE_SECONDS
+            if door.lock and door.lock:IsValid() then
+                local locked = door.lock.bIsDoorLocked
+                if not settled then
+                    st.lock = locked
+                elseif S.pendingLocks[id] ~= nil then      -- a change that arrived before the door loaded
+                    door.lock:SetLocked(S.pendingLocks[id], false)
+                    st.lock = S.pendingLocks[id]
+                    S.pendingLocks[id] = nil
+                elseif st.lock == nil then
+                    st.lock = locked
+                elseif st.lock ~= locked then
+                    st.lock = locked
+                    -- Only unlocking is shared. The game also locks doors behind the player to
+                    -- gate areas; copying that could shut the other player out, and their own
+                    -- game applies the same gating when they get there.
+                    if not locked then
+                        enqueue("lock " .. id .. " 0")
+                        log("door unlocked here, telling the other player")
+                    end
+                end
+            end
+        end
+    end)
+    -- Sliding doors are not in the manager's list and are not moved by this mod yet, but their
+    -- locks work the same way, so unlocking one is shared like any other door.
+    local sliding = {}
+    local slidingAll = FindAllOf("SHSlidingDoorMovementComponent")
+    if slidingAll then
+        for i = 1, #slidingAll do
+            local comp = slidingAll[i]
+            if comp:IsValid() then
+                local owner = comp:GetOwner()
+                local lock = comp.ManagedDoorLockComponent
+                if owner and owner:IsValid() and lock and lock:IsValid() then
+                    local path = owner:GetFullName():match("^%S+%s+(.+)$") or owner:GetFullName()
+                    local id = hashName(path .. "." .. comp:GetFName():ToString())
+                    sliding[#sliding + 1] = { id = id, lock = lock }
+                    seen[id] = true
+                    local st = S.doorState[id]
+                    if not st then st = {} S.doorState[id] = st end
+                    if not (S.doorSeen and S.doorSeen[id]) then st.since = now end
+                    local locked = lock.bIsDoorLocked
+                    if now - (st.since or now) < SETTLE_SECONDS then
+                        st.lock = locked
+                    elseif S.pendingLocks[id] ~= nil then
+                        lock:SetLocked(S.pendingLocks[id], false)
+                        st.lock = S.pendingLocks[id]
+                        S.pendingLocks[id] = nil
+                    elseif st.lock == nil then
+                        st.lock = locked
+                    elseif st.lock ~= locked then
+                        st.lock = locked
+                        if not locked then
+                            enqueue("lock " .. id .. " 0")
+                            log("sliding door unlocked here, telling the other player")
+                        end
+                    end
+                end
+            end
+        end
+    end
+    S.slidingDoors = sliding
+    S.doors = list
+    S.doorSeen = seen
+end
+
+onRemoteLock = function(id, locked)
+    if locked then return end   -- only unlocks are applied (see scanDoors)
+    local st = S.doorState[id]
+    if not st then st = {} S.doorState[id] = st end
+    st.lock = locked
+    for _, list in ipairs({ S.doors, S.slidingDoors or {} }) do
+        for _, door in ipairs(list) do
+            if door.id == id and door.lock and door.lock:IsValid() then
+                door.lock:SetLocked(locked, false)
+                log("door " .. (locked and "locked" or "unlocked") .. " by the other player")
+                return
+            end
+        end
+    end
+    S.pendingLocks[id] = locked
+end
+
+local function dist3(x1, y1, z1, x2, y2, z2)
+    local dx, dy, dz = x1 - x2, y1 - y2, z1 - z2
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- ~10x a second: decide who drives each nearby door, report ours, follow theirs.
+local function doorsTick(pawn)
+    local me = pawn:K2_GetActorLocation()
+    local newest = S.snaps[#S.snaps]
+    local havePeer = peer.connected and newest ~= nil and not S.mirror
+    local theirs = peer.doors or {}
+    local mine = {}
+    local now = os.clock()
+    local body = nil   -- where the other player's body stands in this world, if it is shown
+    if S.avatar and S.avatar:IsValid() and S.avatarVisible then body = S.avatar:K2_GetActorLocation() end
+    if S.testBody then body = S.testBody end   -- development: pretend the body stands somewhere
+    for _, door in ipairs(S.doors) do
+        local comp = door.comp
+        if comp:IsValid() then
+            local myDist = dist3(me.X, me.Y, me.Z, door.x, door.y, door.z)
+            local peerDist = havePeer and dist3(newest.x, newest.y, newest.z, door.x, door.y, door.z) or math.huge
+            local bodyDist = body and dist3(body.X, body.Y, body.Z, door.x, door.y, door.z) or math.huge
+            local prior = S.doorState[door.id]
+            -- also visit doors we are still holding, however far away, so they are always released
+            if myDist < DOOR_RANGE or peerDist < DOOR_RANGE or bodyDist < DOOR_RANGE
+                or (prior and (prior.held or prior.pushed)) then
+                local iDrive = (not havePeer) or myDist < peerDist - DOOR_TIE
+                    or (math.abs(myDist - peerDist) <= DOOR_TIE and S.role == "host")
+                local st = S.doorState[door.id]
+                if not st then st = {} S.doorState[door.id] = st end
+                local target = (not iDrive) and theirs[door.id] or nil
+                if target and not comp.bIsDoorFrozen then
+                    -- A door closes itself when no player of *this* game stands near it, which
+                    -- would undo every move we copy. Hold that off while the other game drives it.
+                    if not st.held then
+                        comp:SetAutocloseBlocked(true, pawn)
+                        st.held = true
+                    end
+                    if math.abs(comp:GetCurrentDoorAngle() - target) > 2 and st.lastTarget ~= target then
+                        st.lastTarget = target
+                        comp:RequestCustomFakeMovement(target, math.max(comp.FakeMovementSpeed * 2, 10), comp.FakeMovementBlendExp, true)
+                    end
+                else
+                    -- Nobody is driving this door remotely. The game only opens doors for its own
+                    -- player, so when the other player's body walks into one here we open it for
+                    -- them, away from the side they are on. (In a real session their own game
+                    -- normally drives the door; this covers the solo test and any gap.)
+                    local leaf = door.leaf
+                    local touching = false
+                    if body and leaf and not comp.bIsDoorFrozen
+                        and not (door.lock and door.lock:IsValid() and door.lock.bIsDoorLocked) then
+                        local dx, dy = body.X - leaf[1], body.Y - leaf[2]
+                        touching = dx * dx + dy * dy < DOOR_TOUCH * DOOR_TOUCH and math.abs(body.Z + 90 - leaf[3]) < 170
+                    end
+                    if touching then
+                        if not st.pushed then
+                            local toPlus = (body.X - leaf[4]) ^ 2 + (body.Y - leaf[5]) ^ 2
+                            local toMinus = (body.X - leaf[6]) ^ 2 + (body.Y - leaf[7]) ^ 2
+                            local wantSign = (toPlus < toMinus) and -1 or 1   -- swing away from them
+                            local openTo = comp.OpenedAngle
+                            if comp.OpenBothSides and (comp.OpenedAngle - comp.ClosedAngle) * wantSign < 0 then
+                                openTo = comp.OtherSideOpenedAngle
+                            end
+                            if not st.held then
+                                comp:SetAutocloseBlocked(true, pawn)
+                                st.held = true
+                            end
+                            comp:RequestCustomFakeMovement(openTo, math.max(comp.FakeMovementSpeed * 2, 10), comp.FakeMovementBlendExp, true)
+                            log(string.format("opened a door for the other player (to %.0f degrees)", openTo))
+                        end
+                        st.pushed = now
+                    elseif st.pushed and now - st.pushed > 1.2 then
+                        st.pushed = nil           -- they have moved on
+                    end
+                    if st.held and not st.pushed then   -- give the door back to the game
+                        comp:SetAutocloseBlocked(false, pawn)
+                        st.held = nil
+                    end
+                    st.lastTarget = nil
+                    if iDrive and myDist < DOOR_RANGE and #mine < 8 then
+                        mine[#mine + 1] = door.id .. ":" .. math.floor(comp:GetCurrentDoorAngle() * 10 + 0.5)
+                    end
+                end
+            end
+        end
+    end
+    S.myDoors = (#mine > 0) and table.concat(mine, " ") or nil
+end
+
+-- ================================================================ moving to the other player
+
+local function teleportPawn(pawn, x, y, z, yaw, why)
+    local p = pawn:K2_GetActorLocation()
+    local far = dist3(p.X, p.Y, p.Z, x, y, z) > 1500
+    pawn:K2_TeleportTo({ X = x, Y = y, Z = z + 5 }, { Pitch = 0, Yaw = yaw, Roll = 0 })
+    pcall(function() getPC():SetControlRotation({ Pitch = 0, Yaw = yaw, Roll = 0 }) end)
+    if far then
+        -- The area may still be streaming in. Hold the player in place for a moment so they
+        -- cannot fall through a floor that is not there yet.
+        pcall(function() pawn.CharacterMovement:SetMovementMode(0, 0) end)   -- 0 = no movement
+        S.releaseMoveAt = os.clock() + 2.0
+    end
+    log("moved to the other player (" .. why .. ")")
+end
+
+-- ================================================================ cutscenes
+
+-- The story follows the host, and both players watch every cutscene together:
+--   * When a cutscene starts in one game, the other player is moved to where it was triggered.
+--     Usually that makes their own game trigger the same cutscene, with all the game logic
+--     attached to it. If it has not started after a moment, it is started directly.
+--   * When it is over, the joiner is placed right beside the host.
+-- Cutscenes are placed in the level, so a hash of their level path identifies them on both PCs.
+
+S.cutPlayers = S.cutPlayers or {}
+
+local function scanCutscenes()
+    local list = {}
+    local all = FindAllOf("SHCutscenePlayer")
+    if all then
+        for i = 1, #all do
+            local c = all[i]
+            if c:IsValid() then
+                local path = c:GetFullName():match("^%S+%s+(.+)$") or c:GetFullName()
+                list[#list + 1] = { id = hashName(path), actor = c }
+            end
+        end
+    end
+    S.cutPlayers = list
+    S.cutScanned = os.clock()
+end
+
+local function findCutscene(id)
+    for _, c in ipairs(S.cutPlayers) do
+        if c.id == id and c.actor:IsValid() then return c.actor end
+    end
+    return nil
+end
+
+local function playingCutscene()
+    for _, c in ipairs(S.cutPlayers) do
+        if c.actor:IsValid() and c.actor:IsPlaying() then return c.id end
+    end
+    return nil
+end
+
+onRemoteCutscene = function(id, x, y, z, yaw)
+    if not on("sync_cutscenes") or S.cutPlaying == id then return end
+    S.cutRequest = { id = id, x = x, y = y, z = z, yaw = yaw, deadline = os.clock() + 12 }
+    S.cutExpected = id   -- when it starts here we must not announce it back
+    log("the other player started a cutscene; joining it")
+end
+
+-- ~3x a second.
+local function cutsceneTick(pawn)
+    local now = os.clock()
+    if not S.cutScanned or now - S.cutScanned > 5 then scanCutscenes() end
+
+    local playing = playingCutscene()
+    if playing ~= S.cutPlaying then
+        if playing then
+            log("cutscene started here")
+            if S.cutExpected ~= playing and not S.mirror then
+                local f = S.freePos
+                if f then enqueue(string.format("cut %s %d %d %d %d", playing, f[1], f[2], f[3], f[4])) end
+            end
+            S.cutExpected, S.cutRequest = nil, nil
+        else
+            log("cutscene ended here")
+            S.regroupAt = now + 0.5
+        end
+        S.cutPlaying = playing
+    end
+    if not playing then
+        local p, r = pawn:K2_GetActorLocation(), pawn:K2_GetActorRotation()
+        S.freePos = { math.floor(p.X), math.floor(p.Y), math.floor(p.Z), math.floor(r.Yaw) }
+    end
+
+    -- a cutscene the other player started and we have not joined yet
+    local req = S.cutRequest
+    if req and not playing then
+        if now > req.deadline then
+            S.cutRequest, S.cutExpected = nil, nil
+            log("could not join the other player's cutscene in time")
+        else
+            local actor = findCutscene(req.id)
+            if not actor and now - S.cutScanned > 1 then scanCutscenes() actor = findCutscene(req.id) end
+            if actor and actor:IsAlreadyPlayedOnce() then
+                S.cutRequest, S.cutExpected = nil, nil      -- this game has already been through it
+            elseif not req.moved then
+                teleportPawn(pawn, req.x, req.y, req.z, req.yaw, "cutscene")
+                req.moved = now
+            elseif actor and not req.started and now - req.moved > 1.5 then
+                req.started = true
+                pcall(function() actor:Activate() end)
+                log("started the cutscene directly")
+            end
+        end
+    end
+
+    -- afterwards the joiner stands beside the host
+    if S.regroupAt and now >= S.regroupAt and not playing then
+        if S.role ~= "join" or not peer.connected or not on("sync_cutscenes") then
+            S.regroupAt = nil
+        elseif peer.cut == "0" then
+            local n = S.snaps[#S.snaps]
+            if n then
+                local p = pawn:K2_GetActorLocation()
+                if dist3(p.X, p.Y, p.Z, n.x, n.y, n.z) > 150 then
+                    local yaw = n.yaw / RAD
+                    teleportPawn(pawn, n.x - math.sin(yaw) * 80, n.y + math.cos(yaw) * 80, n.z, n.yaw, "after the cutscene")
+                end
+            end
+            S.regroupAt = nil
+        end
+    end
+end
+
+-- ================================================================ world pickups
+
+-- With a shared inventory, something picked up in one game is given to both players. The copy
+-- of that pickup lying in the other game's world is then marked collected and removed, so it
+-- cannot be taken a second time.
+
+S.itemState = S.itemState or {}       -- id -> collected?
+S.takenRemote = S.takenRemote or {}   -- id -> true, taken by the other player
+
+onRemoteTook = function(id)
+    S.takenRemote[id] = true
+    S.itemsDue = true
+end
+
+local function itemsTick(pawn)
+    local all = FindAllOf("SHItem")
+    if not all then return end
+    local now = os.clock()
+    local seen = {}
+    S.itemSince = S.itemSince or {}
+    for i = 1, #all do
+        local item = all[i]
+        if item:IsValid() then
+            local id = hashName(item:GetFullName():match("^%S+%s+(.+)$") or "")
+            local collected = item.bWasCollected
+            seen[id] = true
+            -- Like doors, a pickup that just streamed in gets its saved state a moment later;
+            -- wait before reading anything into it.
+            if not (S.itemSeen and S.itemSeen[id]) then S.itemSince[id] = now end
+            if now - (S.itemSince[id] or now) < SETTLE_SECONDS then
+                S.itemState[id] = collected
+            elseif S.takenRemote[id] and not collected then
+                pcall(function() item.bWasCollected = true end)
+                item:SetItemDisabled(true, pawn)
+                item:SetActorHiddenInGame(true)
+                item:SetActorEnableCollision(false)
+                collected = true
+                S.itemState[id] = true
+                log("removed a pickup the other player already took")
+            end
+            local known = S.itemState[id]
+            if known == nil then
+                S.itemState[id] = collected
+            elseif collected and not known then
+                S.itemState[id] = true
+                local row = ""
+                pcall(function() row = item.ItemData.RowName:ToString() end)
+                if row == "" or itemShared(row) then enqueue("took " .. id) end
+            end
+        end
+    end
+    S.itemSeen = seen
+end
+
+-- ================================================================ pushable objects
+
+-- Furniture and carts the player can push. Whoever is pushing drives the object: their game
+-- reports its position ~10x a second, and the other game moves its copy with the pushable's own
+-- "teleport to" call. When they let go, the resting place is sent once more as a reliable event
+-- so it sticks even if a packet was lost.
+
+S.pushables = S.pushables or {}     -- loaded: { id, comp, owner }
+S.pushState = S.pushState or {}     -- id -> { since = first seen, mine = true while we push it }
+S.pushRemote = S.pushRemote or {}   -- id -> { x, y, z }, resting places reported by the other player
+
+local function scanPushables()
+    local list, seen = {}, {}
+    local now = os.clock()
+    local all = FindAllOf("SHPushableComponent")
+    if all then
+        for i = 1, #all do
+            local comp = all[i]
+            if comp:IsValid() then
+                local owner = comp:GetOwner()
+                if owner and owner:IsValid() then
+                    local id = hashName(owner:GetFullName():match("^%S+%s+(.+)$") or "")
+                    list[#list + 1] = { id = id, comp = comp, owner = owner }
+                    seen[id] = true
+                    local st = S.pushState[id]
+                    if not st then st = {} S.pushState[id] = st end
+                    if not (S.pushSeen and S.pushSeen[id]) then st.since = now end   -- just streamed in
+                end
+            end
+        end
+    end
+    S.pushables = list
+    S.pushSeen = seen
+end
+
+onRemotePush = function(id, x, y, z)
+    S.pushRemote[id] = { x, y, z }
+end
+
+-- ~10x a second.
+local function pushablesTick(pawn)
+    local pawnAddr = pawn:GetAddress()
+    local theirs = peer.pushing or {}
+    local mine = {}
+    local now = os.clock()
+    for _, p in ipairs(S.pushables) do
+        if p.comp:IsValid() and p.owner:IsValid() then
+            local st = S.pushState[p.id]
+            if not st then st = { since = now } S.pushState[p.id] = st end
+            local loc = p.owner:K2_GetActorLocation()
+            local pushing = false
+            pcall(function()
+                local who = p.comp.InteractingCharacter
+                pushing = who ~= nil and who:IsValid() and who:GetAddress() == pawnAddr
+            end)
+            if pushing then
+                st.mine = true
+                if #mine < 4 then
+                    mine[#mine + 1] = string.format("%s:%d:%d:%d", p.id, math.floor(loc.X), math.floor(loc.Y), math.floor(loc.Z))
+                end
+            else
+                if st.mine then   -- we just let go
+                    st.mine = nil
+                    if not S.mirror then
+                        enqueue(string.format("push %s %d %d %d", p.id, math.floor(loc.X), math.floor(loc.Y), math.floor(loc.Z)))
+                    end
+                    log("you moved an object" .. (S.mirror and "" or ", telling the other player"))
+                end
+                -- follow the other player's copy, once ours has settled after loading
+                local target = theirs[p.id] or S.pushRemote[p.id]
+                if target and now - (st.since or now) >= SETTLE_SECONDS then
+                    if dist3(target[1], target[2], target[3], loc.X, loc.Y, loc.Z) > 3 then
+                        pcall(function() p.comp:TeleportAbsolute({ X = target[1], Y = target[2], Z = target[3] }) end)
+                    end
+                    if S.pushRemote[p.id] and not theirs[p.id] then
+                        S.pushRemote[p.id] = nil
+                        log("an object the other player moved is now in the same place here")
+                    end
+                end
+            end
+        end
+    end
+    S.myPushing = (#mine > 0) and table.concat(mine, " ") or nil
+end
+
+-- ================================================================ going to the other player
+
+-- A catch-all for anything that separates the players and is not synced: elevators, jumping
+-- down a hole, a one-way drop, or plain drift. F7 in game, or the launcher's button.
+local function regroupNow(pawn)
+    local n = S.snaps[#S.snaps]
+    if not n or (os.clock() - peer.lastTime) > staleSeconds() then
+        log("cannot go to the other player: no news of them")
+        return
+    end
+    local yaw = n.yaw / RAD
+    teleportPawn(pawn, n.x - math.sin(yaw) * 80, n.y + math.cos(yaw) * 80, n.z, n.yaw, "on request")
+end
+
+-- F7, because UE4SS's own console mod already takes F10 and tilde.
+local function tryInstallRegroupKey()
+    if S.regroupKeyF7 or S.regroupKeyFailed then return end
+    local ok, err = pcall(RegisterKeyBind, Key.F7, function()
+        local impl = CoopGhost.impl
+        if impl and impl.onKey then pcall(impl.onKey, "F7") end
+    end)
+    if ok then S.regroupKeyF7 = true else S.regroupKeyFailed = true log("F7 could not be bound: " .. tostring(err)) end
+end
+
+-- The launcher can ask for things by dropping a one-word file into the ipc folder.
+local function readLauncherCommand()
+    local path = DIR .. "\\command.txt"
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local word = (f:read("a") or ""):match("%a+")
+    f:close()
+    os.remove(path)
+    return word
+end
+
+-- ================================================================ saving and loading together
+
+-- Each PC keeps its own save files, and the game can only "reload the latest save" from code,
+-- not load a chosen slot. So the two games are kept in step like this:
+--   * When the host's game saves, the joiner's game saves at the same moment (into the same
+--     slot number when the host used one). Both PCs then hold a save of the same point.
+--   * When the host loads, or dies and reloads, the joiner reloads its own latest save, which
+--     is that matching one, and is then placed beside the host.
+-- Limit: if the host deliberately loads an older slot, the joiner still gets its latest save.
+
+local SAVE_FUNCTIONS = { "MakeFullSave", "SaveGame", "MakeQuickSave", "AutoSave" }
+
+local function gameStatics()
+    local st = StaticFindObject("/Script/GameBase.Default__GameBaseStatics")
+    return (st and st:IsValid()) and st or nil
+end
+
+-- Called from the hooks below whenever this game saves.
+local function onLocalSave(fn, slot)
+    if S.savingForPeer or not on("sync_saves") then return end
+    if S.role == "join" or S.mirror or not peer.connected then return end
+    local now = os.clock()
+    if now - (S.lastSaveSent or -100) < 5 then return end   -- one save can call several of these
+    S.lastSaveSent = now
+    enqueue("saved " .. tostring(slot))
+    log("you saved; the joiner's game will save too")
+end
+
+local function tryInstallSaveHooks()
+    if S.saveHooks then return end
+    S.saveHooks = {}
+    for _, fn in ipairs(SAVE_FUNCTIONS) do
+        local ok = pcall(RegisterHook, "/Script/GameBase.GameBaseStatics:" .. fn, function(_, _, firstParam)
+            local slot = -1
+            if fn == "MakeFullSave" then pcall(function() slot = math.floor(firstParam:get()) end) end
+            local impl = CoopGhost.impl
+            if impl and impl.onLocalSave then pcall(impl.onLocalSave, fn, slot) end
+        end)
+        S.saveHooks[fn] = ok
+    end
+    local names = {}
+    for fn, ok in pairs(S.saveHooks) do if ok then names[#names + 1] = fn end end
+    log("save hooks installed: " .. (#names > 0 and table.concat(names, ", ") or "none"))
+end
+
+onRemoteSaved = function(pawn, slot)
+    if not on("sync_saves") or S.role ~= "join" then return end
+    local st = gameStatics()
+    if not st then return end
+    S.savingForPeer = true
+    local ok, err = pcall(function()
+        if slot >= 0 then
+            st:MakeFullSave(pawn:GetWorld(), slot, "Co-op", false, true)
+        else
+            st:AutoSave(pawn:GetWorld(), "Co-op", false, true)
+        end
+    end)
+    S.savingForPeer = nil
+    log(ok and "saved here because the host saved" or ("could not save with the host: " .. tostring(err)))
+end
+
+onRemoteLoaded = function(pawn)
+    if not on("sync_saves") or S.role ~= "join" then return end
+    local now = os.clock()
+    if now - (S.lastReloadAt or -100) < 20 then return end   -- one reload per host load
+    S.lastReloadAt = now
+    log("the host loaded; loading here too")
+    local ok, err = pcall(function() UEHelpers.GetGameInstance():ReloadGame(false, "", false, nil, 0) end)
+    if not ok then log("could not load with the host: " .. tostring(err)) end
+end
+
+-- Called when our player is back after not existing for a while, i.e. a load just finished.
+local function onLoadedHere(pawn)
+    if not on("sync_saves") then return end
+    if S.role == "join" then
+        S.regroupAfterLoad = os.clock() + 3      -- stand beside the host once they are visible
+    elseif peer.connected and not S.mirror then
+        enqueue("loaded")
+        log("you loaded; the joiner's game will load too")
+    end
+end
+
+-- ================================================================ puzzles
+
+-- One player solves a puzzle, the story moves on for both. Every puzzle you zoom in on (safes,
+-- padlocks and door locks, the coin cabinet and so on) carries the same component with a
+-- "solved" state and a "set solved" call. When a puzzle becomes solved in one game, the other
+-- game marks its copy solved too, which makes that game run the puzzle's own follow-up: the
+-- lock opens, the item appears, the cutscene starts. Puzzles are placed in the level, so a
+-- hash of their level path names them on both PCs.
+
+S.puzzleState = S.puzzleState or {}     -- id -> solved?
+S.solvedRemote = S.solvedRemote or {}   -- id -> true, solved by the other player
+
+onRemoteSolved = function(id)
+    S.solvedRemote[id] = true
+    S.puzzlesDue = true
+end
+
+local function puzzlesTick(pawn)
+    local all = FindAllOf("SHFocusableComponent")
+    if not all then return end
+    local now = os.clock()
+    local seen = {}
+    S.puzzleSince = S.puzzleSince or {}
+    for i = 1, #all do
+        local comp = all[i]
+        if comp:IsValid() then
+            local owner = comp:GetOwner()
+            if owner and owner:IsValid() then
+                local id = hashName(owner:GetFullName():match("^%S+%s+(.+)$") or "")
+                local solved = comp:IsSolved()
+                seen[id] = true
+                -- like doors and pickups: leave a freshly loaded puzzle alone while the game
+                -- is still applying its saved state
+                if not (S.puzzleSeen and S.puzzleSeen[id]) then S.puzzleSince[id] = now end
+                if now - (S.puzzleSince[id] or now) < SETTLE_SECONDS then
+                    S.puzzleState[id] = solved
+                else
+                    -- solved by the other player: solve it here too, unless we are in the middle
+                    -- of working on it ourselves (then wait until we step away)
+                    if S.solvedRemote[id] and not solved and not comp:IsShown() then
+                        pcall(function() comp:SetSolved() end)
+                        solved = comp:IsSolved()
+                        S.puzzleState[id] = true
+                        log("a puzzle the other player solved is now solved here" .. (solved and "" or " (the game did not accept it)"))
+                        if solved then S.solvedRemote[id] = nil end
+                    end
+                    local known = S.puzzleState[id]
+                    if known == nil then
+                        S.puzzleState[id] = solved
+                    elseif solved and not known then
+                        S.puzzleState[id] = true
+                        if not S.mirror then enqueue("solved " .. id) end
+                        log("you solved a puzzle" .. (S.mirror and "" or ", telling the other player"))
+                    end
+                end
+            end
+        end
+    end
+    S.puzzleSeen = seen
+end
+
+-- ================================================================ enemies
+
+-- Both games keep running their own copy of every enemy (they come from the same spawners
+-- placed in the level, so a hash of the spawner's path names an enemy on both PCs). Animation,
+-- attacks and damage to the local player all stay native. The mod makes the copies agree:
+--   * Health: damage either player deals is sent as a reliable event and applied to the other
+--     copy; the host's health value is the reference the joiner follows.
+--   * Target: an enemy that hunts one player hunts that player's body in the other game too,
+--     so both copies chase the same person. Enemies treat whoever is closer as the threat.
+--   * Position: the joiner's copy is nudged toward where the host's copy is.
+-- Enemies not spawned by a single spawner (scripted groups, bosses) are left alone for now.
+
+local ENEMY_RANGE = 3000     -- enemies this close to a player are handled (centimetres)
+local ENEMY_MAX = 8          -- at most this many per packet
+local ENEMY_SWITCH = 200     -- how much closer the other player must be before a target switches
+S.enemies = S.enemies or {}        -- loaded: { id, actor, health }
+S.enemyState = S.enemyState or {}  -- id -> { hp = last seen, forced = true when sent after the avatar }
+
+local function scanEnemies()
+    local list = {}
+    local spawners = FindAllOf("SHAISpawner")
+    if spawners then
+        for i = 1, #spawners do
+            local sp = spawners[i]
+            if sp:IsValid() then
+                local actor = sp:GetSpawnedActor()
+                if actor and actor:IsValid() then
+                    local health = actor.healthComponent
+                    if health and health:IsValid() then
+                        local path = sp:GetFullName():match("^%S+%s+(.+)$") or sp:GetFullName()
+                        list[#list + 1] = { id = hashName(path), actor = actor, health = health }
+                    end
+                end
+            end
+        end
+    end
+    S.enemies = list
+end
+
+local function findEnemy(id)
+    for _, e in ipairs(S.enemies) do
+        if e.id == id and e.actor:IsValid() then return e end
+    end
+    return nil
+end
+
+-- Send an enemy after the other player's body, or let it go back to its own judgement.
+local function forceOntoAvatar(e, st, yes)
+    local ctl = e.actor.Controller
+    if not (ctl and ctl:IsValid()) then return end
+    if yes then
+        if st.forced or not (S.avatar and S.avatar:IsValid()) then return end
+        local ok = pcall(function() ctl:SetForcedEnemy(S.avatar) end)
+        if ok then
+            st.forced = true
+            log("an enemy now hunts the other player")
+        end
+    elseif st.forced then
+        pcall(function() ctl:SetForcedEnemy(nil) end)
+        pcall(function() ctl:ClearForceChase() end)
+        st.forced = nil
+        log("an enemy stopped hunting the other player")
+    end
+end
+
+onRemoteEnemyDamage = function(pawn, id, amount)
+    if not on("sync_enemies") then return end
+    local e = findEnemy(id)
+    if not e then return end      -- not loaded here; the host's health value catches it up later
+    local st = S.enemyState[id]
+    if not st then st = {} S.enemyState[id] = st end
+    local from = (S.avatar and S.avatar:IsValid()) and S.avatar or pawn
+    pcall(function() e.health:ReceiveDamage(amount, from) end)
+    st.hp = e.health:GetHealth()   -- so we do not report this drop back as our own
+end
+
+local function hasPendingDamage(id)
+    local prefix = "edmg " .. id .. " "
+    for i = 1, #S.outbox do
+        if S.outbox[i].text:sub(1, #prefix) == prefix then return true end
+    end
+    return false
+end
+
+-- ~10x a second.
+local function enemiesTick(pawn)
+    local me = pawn:K2_GetActorLocation()
+    local pawnAddr = pawn:GetAddress()
+    local newest = S.snaps[#S.snaps]
+    local other = (newest and S.avatar and S.avatar:IsValid() and S.avatarVisible) and newest or nil
+    local isHost = S.role ~= "join" or S.mirror
+    local theirs = peer.enemies or {}
+    local hunted = peer.hunted or {}
+    local mineOut, huntedOut = {}, {}
+
+    for _, e in ipairs(S.enemies) do
+        local actor = e.actor
+        if actor:IsValid() and e.health:IsValid() then
+            local loc = actor:K2_GetActorLocation()
+            local dMe = dist3(me.X, me.Y, me.Z, loc.X, loc.Y, loc.Z)
+            local dOther = other and dist3(other.x, other.y, other.z, loc.X, loc.Y, loc.Z) or math.huge
+            local st = S.enemyState[e.id]
+            if dMe < ENEMY_RANGE or dOther < ENEMY_RANGE or (st and st.forced) then
+                if not st then st = {} S.enemyState[e.id] = st end
+                local hp = e.health:GetHealth()
+
+                -- damage we dealt here since the last look
+                if st.hp and hp < st.hp and not S.mirror then
+                    enqueue(string.format("edmg %s %d", e.id, math.ceil(st.hp - hp)))
+                end
+                st.hp = hp
+
+                local alive = hp > 0
+                local huntsMe = false
+                if alive then
+                    pcall(function()
+                        local arch = actor.Controller:GetArchEnemy()
+                        huntsMe = arch ~= nil and arch:IsValid() and arch:GetAddress() == pawnAddr
+                    end)
+                end
+
+                if isHost then
+                    -- The host decides who each enemy is after.
+                    if not alive or not other or dOther > ENEMY_RANGE then
+                        forceOntoAvatar(e, st, false)
+                    elseif st.forced then
+                        -- back to us once we are clearly the closer one
+                        if dMe + ENEMY_SWITCH < dOther then forceOntoAvatar(e, st, false) end
+                    elseif huntsMe or hunted[e.id] then
+                        -- Only enemies that are already alert in one of the games are redirected,
+                        -- never sleeping ones. They go after the other player when only that
+                        -- player's game has noticed them, or when that player is clearly closer.
+                        if (hunted[e.id] and not huntsMe) or dOther + ENEMY_SWITCH < dMe then
+                            forceOntoAvatar(e, st, true)
+                        end
+                    end
+                    if #mineOut < ENEMY_MAX then
+                        mineOut[#mineOut + 1] = string.format("%s:%d:%d:%d:%d:%s", e.id, math.floor(loc.X), math.floor(loc.Y),
+                            math.floor(loc.Z), math.floor(hp), st.forced and "j" or (huntsMe and "h" or "n"))
+                    end
+                else
+                    -- The joiner follows the host's copy.
+                    if huntsMe and alive and #huntedOut < ENEMY_MAX then huntedOut[#huntedOut + 1] = e.id end
+                    local t = theirs[e.id]
+                    if t then
+                        forceOntoAvatar(e, st, alive and t.target == "h")
+                        if t.hp ~= hp and not hasPendingDamage(e.id) then
+                            if t.hp <= 0 and alive then
+                                pcall(function() e.health:Kill() end)
+                            elseif t.hp > 0 and alive then
+                                pcall(function() e.health:SetHealth(t.hp) end)
+                            end
+                            st.hp = e.health:GetHealth()
+                        end
+                        if alive then
+                            local d = dist3(t.x, t.y, t.z, loc.X, loc.Y, loc.Z)
+                            if d > 700 then
+                                actor:K2_SetActorLocation({ X = t.x, Y = t.y, Z = t.z }, false, {}, true)
+                            elseif d > 150 then
+                                actor:K2_SetActorLocation({ X = loc.X + (t.x - loc.X) * 0.25, Y = loc.Y + (t.y - loc.Y) * 0.25,
+                                    Z = loc.Z + (t.z - loc.Z) * 0.25 }, false, {}, false)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    S.myEnemies = (#mineOut > 0) and table.concat(mineOut, " ") or nil
+    S.myHunted = (#huntedOut > 0) and table.concat(huntedOut, " ") or nil
+end
+
+-- ================================================================ friendly fire
+
+-- Optional, and both players must enable it. The attacker's game decides whether an attack hit
+-- the other player's body as drawn on the attacker's screen, and sends a reliable event; the
+-- victim's game applies the damage through the game's own "player was hit" path.
+--   melee: one hit  = ff_hit_damage (about one enemy hit)
+--   shot:  one shot = twice that
+-- Known limits: shots are tested along the aim line without checking for walls in between, and
+-- melee is judged by reach and facing when the swing ends.
+
+local BODY_RADIUS, BODY_HEIGHT = 40, 180
+local MELEE_REACH = 190
+
+local function sendFriendlyFire(pawn, how, dirX, dirY)
+    local base = tonumber(cfg.ff_hit_damage) or 10
+    if base < 1 then base = 1 elseif base > 100 then base = 100 end
+    local amount = (how == "shot") and base * 2 or base
+    local text = string.format("ff %s %d %d %d", how, math.floor(amount + 0.5), math.floor(dirX * 100), math.floor(dirY * 100))
+    if S.mirror then
+        onRemoteFriendlyFire(pawn, how, amount, dirX, dirY)   -- solo test: hitting your copy hurts you
+    else
+        enqueue(text)
+    end
+    log("friendly fire: your " .. how .. " hit the other player (" .. math.floor(amount + 0.5) .. ")")
+end
+
+onRemoteFriendlyFire = function(pawn, how, amount, dirX, dirY)
+    if not on("friendly_fire") then return end
+    local damageClass = StaticFindObject(how == "shot" and "/Script/SHProto.SHFirearmBaseDamage" or "/Script/SHProto.SHMeleeBaseDamage")
+    local from = (S.avatar and S.avatar:IsValid()) and S.avatar or pawn
+    -- Measured in game: the combat component's ReceiveDamage does not change health (it handles
+    -- the reaction), the health component's does. So call both: reaction first, then the loss.
+    pcall(function() pawn.Combat:ReceiveDamage(amount, from, { X = dirX, Y = dirY, Z = 0 }, damageClass) end)
+    local ok, err = pcall(function() pawn.Health:ReceiveDamage(amount, from, false) end)
+    if not ok then warnOnce("ffdmg:" .. tostring(err), "could not apply friendly fire damage: " .. tostring(err)) end
+    log("friendly fire: the other player's " .. how .. " hit you (" .. math.floor(amount + 0.5) .. ")")
+end
+
+-- Does the line from `o` along unit direction `d`, up to `maxDist`, pass through the avatar?
+local function rayHitsAvatar(o, d, maxDist)
+    local a = S.avatar:K2_GetActorLocation()   -- feet
+    local scale = ((tonumber(cfg.other_player_scale) or 100) / 100) * (S.pelvisScale or 1)
+    local height, radius = BODY_HEIGHT * scale, BODY_RADIUS * scale
+    -- closest approach between the ray and the vertical segment from the feet to the head
+    local wx, wy, wz = o.X - a.X, o.Y - a.Y, o.Z - a.Z
+    local b = d.Z
+    local dw = d.X * wx + d.Y * wy + d.Z * wz
+    local denom = 1 - b * b
+    local s = (denom > 1e-6) and ((wz - b * dw) / denom) or wz
+    if s < 0 then s = 0 elseif s > height then s = height end
+    local t = d.X * (a.X - o.X) + d.Y * (a.Y - o.Y) + d.Z * (a.Z + s - o.Z)
+    if t <= 0 or t > maxDist then return false end
+    local px, py, pz = o.X + d.X * t - a.X, o.Y + d.Y * t - a.Y, o.Z + d.Z * t - (a.Z + s)
+    return px * px + py * py + pz * pz <= radius * radius
+end
+
+local function onShotFired(pawn, weapon)
+    if not (S.avatar and S.avatar:IsValid() and S.avatarVisible) then return end
+    local o, v = weapon:GetStartTraceLoc(), weapon:GetPerfectShootVector()
+    local dx, dy, dz = v.X, v.Y, v.Z
+    if dx * dx + dy * dy + dz * dz > 4 then dx, dy, dz = dx - o.X, dy - o.Y, dz - o.Z end   -- it was an end point
+    local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if len < 1e-4 then return end
+    local d = { X = dx / len, Y = dy / len, Z = dz / len }
+    local maxDist = 5000
+    pcall(function() if weapon.MaxShootDistance > 100 then maxDist = weapon.MaxShootDistance end end)
+    if rayHitsAvatar(o, d, maxDist) then sendFriendlyFire(pawn, "shot", d.X, d.Y) end
+end
+
+-- A shot is recognised by the loaded-ammo total dropping; reloads raise it.
+local function friendlyFireTick(pawn)
+    if not (S.rangedComp and S.rangedComp:IsValid()) then
+        S.rangedComp = FindFirstOf("SHRangedCmbSubcomp")
+        S.ammoTotal = nil
+        if not (S.rangedComp and S.rangedComp:IsValid()) then return end
+    end
+    local total = 0
+    S.rangedComp.WeaponsAmmoCounts:ForEach(function(_, v) total = total + v:get() end)
+    if S.ammoTotal and total < S.ammoTotal then
+        local weapon = S.rangedComp:GetEquippedRangedWeapon()
+        if weapon and weapon:IsValid() then onShotFired(pawn, weapon) end
+    end
+    S.ammoTotal = total
+end
+
+-- Called when one of our melee swings ends (hook below).
+local function onMeleeSwing()
+    if not on("friendly_fire") then return end
+    local pawn = getPawn()
+    if not (pawn and S.avatar and S.avatar:IsValid() and S.avatarVisible) then return end
+    local p, a = pawn:K2_GetActorLocation(), S.avatar:K2_GetActorLocation()
+    local dx, dy = a.X - p.X, a.Y - p.Y
+    local flat = math.sqrt(dx * dx + dy * dy)
+    if flat > MELEE_REACH or flat < 1 then return end
+    if math.abs((a.Z + 90) - p.Z) > 130 then return end           -- on another floor
+    local yaw = pawn:K2_GetActorRotation().Yaw / RAD
+    local facing = (math.cos(yaw) * dx + math.sin(yaw) * dy) / flat  -- 1 = dead ahead
+    if facing < 0.35 then return end                                -- more than ~70 degrees off
+    sendFriendlyFire(pawn, "melee", dx / flat, dy / flat)
+end
+
+local MELEE_HOOK = "/Script/SHProto.SHMeleeCmbSubcomp:OnMeleeAttackEnd"
+local function tryInstallMeleeHook()
+    if S.meleeHooked or S.meleeHookFailed then return end
+    local ok, err = pcall(RegisterHook, MELEE_HOOK, function()
+        local impl = CoopGhost.impl
+        if impl and impl.onMelee then pcall(impl.onMelee) end
+    end)
+    if ok then
+        S.meleeHooked = true
+        log("melee hook installed")
+    else
+        S.meleeHookFailed = true
+        log("melee hook could not be installed, melee friendly fire is unavailable: " .. tostring(err))
+    end
+end
+
 -- ================================================================ messaging
 
 local function readRole()
@@ -875,6 +1950,13 @@ local function writeOut(pawn)
         if okHeld then S.myHeld = held else warnOnce("held:" .. tostring(held), "held items error: " .. tostring(held)) end
     end
     if S.myHeld then lines[#lines + 1] = "H " .. S.myHeld end
+    if S.myDoors and on("sync_doors") then lines[#lines + 1] = "D " .. S.myDoors end
+    lines[#lines + 1] = "C " .. (S.cutPlaying or "0")
+    if S.myPushing and on("sync_pushables") then lines[#lines + 1] = "U " .. S.myPushing end
+    if on("sync_enemies") then
+        if S.myEnemies then lines[#lines + 1] = "N " .. S.myEnemies end   -- host: where its enemies are
+        if S.myHunted then lines[#lines + 1] = "T " .. S.myHunted end     -- joiner: which ones hunt it
+    end
 
     local okFl, fl = pcall(flashlightState, pawn)
     if okFl then lines[#lines + 1] = fl else warnOnce("fl:" .. tostring(fl), "flashlight read error: " .. tostring(fl)) end
@@ -895,6 +1977,10 @@ end
 
 local function onPeerConnected(pawn, isNewSession)
     log("peer connected (session " .. tostring(peer.session) .. ")")
+    -- Whatever queued up while we played alone belongs to the time before this session.
+    if isNewSession then
+        for i = #S.outbox, 1, -1 do S.outbox[i] = nil end
+    end
     -- Only a peer that just started needs the whole inventory. After a short network dropout
     -- the unacknowledged events on both sides are still queued and catch them up.
     if S.role == "host" and isNewSession and on("share_inventory") and on("host_inventory_wins") then
@@ -926,6 +2012,7 @@ local function readIn(pawn)
     local first = true
     local loopback = false
     local snap = nil
+    local doorsSeen, enemiesSeen, huntedSeen, pushingSeen = {}, {}, {}, {}
     for line in text:gmatch("[^\r\n]+") do
         if first then
             first = false
@@ -975,6 +2062,24 @@ local function readIn(pawn)
             if snap and flOn then snap.fl, snap.fp, snap.fy = tonumber(flOn), tonumber(fp), tonumber(fy) end
         elseif line:sub(1, 2) == "M " then
             peer.model = line:match("^M (%w+)")
+        elseif line:sub(1, 2) == "D " then
+            for id, angle in line:gmatch("(%x+):(%-?%d+)") do doorsSeen[id] = tonumber(angle) / 10 end
+        elseif line:sub(1, 2) == "U " and not loopback then
+            for id, x, y, z in line:gmatch("(%x+):(%-?%d+):(%-?%d+):(%-?%d+)") do
+                pushingSeen[id] = { tonumber(x), tonumber(y), tonumber(z) }
+            end
+        elseif line:sub(1, 2) == "N " and not loopback then
+            for id, x, y, z, hp, target in line:gmatch("(%x+):(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+):(%a)") do
+                enemiesSeen[id] = { x = tonumber(x), y = tonumber(y), z = tonumber(z), hp = tonumber(hp), target = target }
+            end
+        elseif line:sub(1, 2) == "T " and not loopback then
+            for id in line:sub(3):gmatch("%x+") do huntedSeen[id] = true end
+        elseif line:sub(1, 2) == "C " and not loopback then
+            local cut = line:match("^C (%x+)") or "0"
+            if peer.cut and peer.cut ~= "0" and cut == "0" and S.role == "join" then
+                S.regroupAt = os.clock() + 0.7     -- the host's cutscene just ended
+            end
+            peer.cut = cut
         elseif not loopback then
             local id, body = line:match("^E (%d+) (.+)$")
             id = tonumber(id)
@@ -985,7 +2090,15 @@ local function readIn(pawn)
             end
         end
     end
-    if snap then pushSnap(snap) end
+    if snap then
+        pushSnap(snap)
+        if not loopback then
+            peer.doors = doorsSeen       -- the doors they are driving right now
+            peer.enemies = enemiesSeen   -- host's enemies (empty when they are the joiner)
+            peer.hunted = huntedSeen     -- enemies hunting them in their own game
+            peer.pushing = pushingSeen   -- objects they are pushing right now
+        end
+    end
 end
 
 -- ================================================================ dev channel
@@ -1037,9 +2150,40 @@ local function tick()
         S.avatar = nil
         S.snaps = {}
         S.known = nil   -- the inventory is rebuilt on load; start over when the player is back
+        S.doors, S.doorState = {}, {}   -- doors are reloaded with the level, so forget what we held
+        S.cutPlayers, S.cutPlaying, S.cutRequest, S.cutExpected, S.regroupAt = {}, nil, nil, nil, nil
+        S.itemState, S.takenRemote, S.itemSeen, S.itemSince, S.doorSeen = {}, {}, nil, nil, nil
+        S.enemies, S.enemyState = {}, {}
+        S.puzzleState, S.solvedRemote, S.puzzleSeen, S.puzzleSince = {}, {}, nil, nil
+        S.pushables, S.pushState, S.pushRemote, S.pushSeen = {}, {}, {}, nil
+        S.pawnGone = true   -- menu, loading screen or death: the next time we exist, a load has finished
         return
     end
+    -- While a save is loading the pawn exists before its parts do; wait until it is whole.
+    local whole = pcall(function() assert(pawn.Mesh:IsValid() and pawn.Items:IsValid() and pawn.Health:IsValid()) end)
+    if not whole then return end
     S.tickCount = S.tickCount + 1
+
+    if S.pawnGone then
+        S.pawnGone = nil
+        local ok, err = pcall(onLoadedHere, pawn)
+        if not ok then warnOnce("loaded:" .. tostring(err), "load sync error: " .. tostring(err)) end
+    end
+    if on("sync_saves") then tryInstallSaveHooks() end
+    if S.regroupAfterLoad then
+        local now = os.clock()
+        if now > S.regroupAfterLoad + 30 then
+            S.regroupAfterLoad = nil                       -- the host never showed up; stay put
+        elseif now >= S.regroupAfterLoad and #S.snaps > 0 and now - peer.lastTime < 2 and (peer.cut or "0") == "0" then
+            S.regroupAfterLoad = nil
+            S.regroupRequested = true                      -- carried out further down this tick
+        end
+    end
+
+    if S.releaseMoveAt and os.clock() >= S.releaseMoveAt then
+        S.releaseMoveAt = nil
+        pcall(function() pawn.CharacterMovement:SetMovementMode(1, 0) end)   -- 1 = walking
+    end
     if S.tickCount % 30 == 1 then readRole() end
 
     if S.tickCount % 30 == 1 then readConfig() end
@@ -1070,6 +2214,77 @@ local function tick()
     end
     if not S.mirror then readIn(pawn) end
 
+    if on("sync_doors") then
+        if S.tickCount % 90 == 3 then
+            local ok, err = pcall(scanDoors)
+            if not ok then warnOnce("doorscan:" .. tostring(err), "door scan error: " .. tostring(err)) end
+        end
+        if S.tickCount % 3 == 0 then
+            local ok, err = pcall(doorsTick, pawn)
+            if not ok then warnOnce("doors:" .. tostring(err), "door sync error: " .. tostring(err)) end
+        end
+    else
+        S.myDoors = nil
+    end
+
+    if on("sync_enemies") then
+        if S.tickCount % 60 == 11 then
+            local ok, err = pcall(scanEnemies)
+            if not ok then warnOnce("enemyscan:" .. tostring(err), "enemy scan error: " .. tostring(err)) end
+        end
+        if S.tickCount % 3 == 1 then
+            local ok, err = pcall(enemiesTick, pawn)
+            if not ok then warnOnce("enemies:" .. tostring(err), "enemy sync error: " .. tostring(err)) end
+        end
+    else
+        S.myEnemies, S.myHunted = nil, nil
+    end
+
+    if on("sync_pushables") then
+        if S.tickCount % 60 == 31 then
+            local ok, err = pcall(scanPushables)
+            if not ok then warnOnce("pushscan:" .. tostring(err), "pushable scan error: " .. tostring(err)) end
+        end
+        if S.tickCount % 3 == 2 then
+            local ok, err = pcall(pushablesTick, pawn)
+            if not ok then warnOnce("push:" .. tostring(err), "pushable sync error: " .. tostring(err)) end
+        end
+    else
+        S.myPushing = nil
+    end
+
+    -- "go to the other player": F7, or the launcher's button
+    tryInstallRegroupKey()
+    if S.tickCount % 30 == 17 and readLauncherCommand() == "regroup" then S.regroupRequested = true end
+    if S.regroupRequested then
+        S.regroupRequested = nil
+        local ok, err = pcall(regroupNow, pawn)
+        if not ok then log("could not go to the other player: " .. tostring(err)) end
+    end
+
+    if on("sync_puzzles") and (S.puzzlesDue or S.tickCount % 60 == 23) then
+        S.puzzlesDue = nil
+        local ok, err = pcall(puzzlesTick, pawn)
+        if not ok then warnOnce("puzzles:" .. tostring(err), "puzzle sync error: " .. tostring(err)) end
+    end
+
+    if on("sync_cutscenes") and S.tickCount % 10 == 5 then
+        local ok, err = pcall(cutsceneTick, pawn)
+        if not ok then warnOnce("cut:" .. tostring(err), "cutscene sync error: " .. tostring(err)) end
+    end
+
+    if on("share_inventory") and (S.itemsDue or S.tickCount % 60 == 7) then
+        S.itemsDue = nil
+        local ok, err = pcall(itemsTick, pawn)
+        if not ok then warnOnce("items:" .. tostring(err), "pickup sync error: " .. tostring(err)) end
+    end
+
+    if on("friendly_fire") then
+        tryInstallMeleeHook()
+        local ok, err = pcall(friendlyFireTick, pawn)
+        if not ok then warnOnce("ff:" .. tostring(err), "friendly fire error: " .. tostring(err)) end
+    end
+
     -- Creating components and swapping meshes is kept out of the per-frame path on purpose.
     local okMine, errMine = pcall(manageSelf, pawn)
     if not okMine then warnOnce("manageSelf:" .. tostring(errMine), "own model setup error: " .. tostring(errMine)) end
@@ -1099,6 +2314,9 @@ local function tick()
             end
         end
 
+        ok, err = pcall(updateCollision, pawn)
+        if not ok then warnOnce("collision:" .. tostring(err), "collision setup error: " .. tostring(err)) end
+
         if S.avatarScale ~= cfg.other_player_scale then
             S.avatarScale = cfg.other_player_scale
             local s = (tonumber(cfg.other_player_scale) or 100) / 100
@@ -1114,6 +2332,10 @@ local function tick()
 end
 
 local function onKey(key)
+    if key == "F7" then
+        S.regroupRequested = true   -- carried out on the game thread by the next tick
+        return
+    end
     if key == "F9" then
         S.mirror = not S.mirror
         S.snaps = {}
@@ -1162,4 +2384,5 @@ local function tickAndDraw()
     end
 end
 
-return { version = VERSION, tick = tickAndDraw, onKey = onKey, onFrame = onFrame }
+return { version = VERSION, tick = tickAndDraw, onKey = onKey, onFrame = onFrame, onMelee = onMeleeSwing,
+    onLocalSave = onLocalSave }

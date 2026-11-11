@@ -23,21 +23,39 @@ simulated second player; a full session between two real PCs still needs testing
 | Equipped weapon, flashlight and radio shown on the other player | Working |
 | Other player's flashlight beam lights your world | Working |
 | Shared inventory (ammo, healing, documents, key items), each kind switchable | Working |
-| Play as James, Maria, Angela, Eddie or Mary, for the other player and on your own screen | Working, poses on non-James bodies are approximate |
+| Doors react to the other player's body, and open, close and unlock for both players | Reaction and remote moves tested solo; needs a two-PC test |
+| Cutscenes: both players watch together, then the joiner regroups beside the host | Detection runs; joining and regrouping need a two-PC test |
+| World pickups: taken once for both players (with shared inventory) | Tracking runs; removal needs a two-PC test |
+| Collision with the other player (optional) | Working |
+| Friendly fire (optional): a melee hit costs about one enemy hit, a shot double | Damage path tested; hit detection needs a two-PC test |
+| Play as James, Maria, Angela or Mary, for the other player and on your own screen | Working, poses on non-James bodies are approximate |
 | Launcher: host / join, install, live tweaks, themes | Working, network path needs a two-PC test |
 | Health | Separate on purpose |
 | Map and item-inspection screens | Separate (they are local menus) |
-| Shared enemies and combat | Not started |
-| Shared puzzles, doors, cutscenes and progress | Not started |
+| Shared enemies: same health and deaths, agreed targets, joiner follows the host's positions | Tracking and sending run; damage sharing, retargeting and position following need a two-PC test |
+| Enemies from scripted groups and bosses | Not synced |
+| Puzzles: solved by one player, solved for both (safes, padlocks, door locks, cabinet puzzles) | Tracking runs; solving the other player's copy needs a two-PC test |
+| Puzzle progress short of solved (pieces placed, dials turned) | Not synced; one player does the puzzle |
+| Pushable objects: furniture one player pushes moves for both | Built from the game's class layout; not yet tried on a real object |
+| Saving and loading together: the joiner saves when the host saves and reloads when the host loads | Save hooks installed; saving and reloading the joiner need a two-PC test |
+| Go to the other player (F7 in game, or the launcher button) | Working |
+| Sliding doors | Unlocks shared; opening and closing not synced |
+| Plain switches, item containers, elevators, breakable glass | Not synced; use F7 if an elevator or a drop separates you |
+| Save points, boss fights, companion characters, endings tracking | Not synced |
 
-Until the last two rows exist, each player still fights their own enemies and solves their own
-puzzles. Play through the same areas together and it holds up; drift apart and the worlds diverge.
+The intended way to play: both players share one inventory, one of them works a puzzle with
+the items you found, and when it is solved the story moves on for both. Play through the same areas together and it holds up; drift apart and the worlds
+diverge.
 
 ## The launcher
 
-| Tweaks | Characters |
+| Tweaks | World |
 |---|---|
-| ![Tweaks page](docs/screenshots/tweaks.png) | ![Characters page](docs/screenshots/characters.png) |
+| ![Tweaks page](docs/screenshots/tweaks.png) | ![World page](docs/screenshots/world.png) |
+
+| Characters | |
+|---|---|
+| ![Characters page](docs/screenshots/characters.png) | |
 
 | Appearance | About |
 |---|---|
@@ -60,7 +78,16 @@ All tweaks apply immediately, also while the game is running.
 | | Share ammunition / healing items / maps, notes and photos / weapons, keys and puzzle items | all on |
 | Other player | Show the other player | on |
 | | Show held items (weapon, flashlight, radio) | on |
+| | Collision (their body blocks you and enemies) | off |
 | | Size | 100 % |
+| World | Puzzles | on |
+| | Doors | on |
+| | Pushable objects | on |
+| | Cutscenes | on |
+| | Save and load together | on |
+| Combat | Shared enemies | on |
+| | Friendly fire (both players must enable it) | off |
+| | Damage per melee hit (a shot is double) | 10 hp |
 | Flashlight | Their flashlight lights my world | on |
 | | Beam casts shadows | off |
 | | Beam brightness | 100 % |
@@ -93,6 +120,8 @@ All tweaks apply immediately, also while the game is running.
 5. Both load the same save. The status turns green when packets arrive from the other player.
 
 In game, **F9** toggles a solo test: the other player's body appears beside you and copies you.
+**F7** moves you to the other player, for when an elevator, a drop or anything unsynced
+separates you.
 
 To uninstall, delete `dwmapi.dll` and the `ue4ss` folder from `<game>\SHProto\Binaries\Win64`.
 
@@ -116,6 +145,41 @@ The game ships without any networking, and Lua inside UE4SS has no sockets, so t
   acknowledges it. On connect the host's inventory is the starting point.
 - **Seeing yourself as another character** keeps the real James animating but invisible, and
   poses a second body from him every frame, fingers included.
+- **Doors** are each driven by one game: the one whose player stands closer. That game reports
+  the door's angle and the other moves its copy to match, holding off the door's auto-close
+  while it does. Where no game is driving a door, the other player's body pushes it open
+  locally, away from the side they stand on. Unlocks travel as reliable events; re-locks do
+  not, because the game also locks doors behind the player to gate areas.
+- **Cutscenes** are identified by their level path. When one starts, the other player is moved
+  to where it was triggered, which normally makes their own game trigger it too, with all the
+  logic attached; if it has not started after a moment it is started directly. Afterwards the
+  joiner is placed beside the host.
+- **Pickups** taken in one game are marked collected and removed in the other, so a shared
+  item is not collected twice. Freshly streamed-in doors and pickups are left alone for a few
+  seconds, since the game is still applying their saved state.
+- **Puzzles** you zoom in on all carry the same component, with a solved state and a "set
+  solved" call. When one becomes solved in one game, the other game marks its copy solved,
+  which runs that puzzle's own follow-up there: the lock opens, the item appears, the cutscene
+  starts. A puzzle you are in the middle of is not solved under you; it waits until you step
+  away.
+- **Pushable objects** are driven by whoever is pushing: their game reports the object's
+  position and the other game moves its copy with the pushable's own "teleport to" call. The
+  resting place is sent once more as a reliable event when they let go.
+- **Saving and loading**: each PC keeps its own save files, and from code the game can only
+  reload its latest save. So when the host's game saves, the joiner's game saves too (same slot
+  number when the host used one), and when the host loads or dies, the joiner reloads its own
+  latest save and is placed beside the host. If the host deliberately loads an older slot, the
+  joiner still gets its latest.
+- **Enemies** run in both games; they come from the same spawners placed in the level, so a
+  hash of the spawner's path names an enemy on both PCs. Animation, attacks and damage to the
+  local player stay native. The mod makes the two copies agree: damage either player deals is
+  sent as a reliable event and applied to the other copy, with the host's health as the
+  reference; an enemy hunting one player is sent after that player's body in the other game,
+  and goes for whoever is clearly closer; the joiner's copy is nudged toward the host's
+  position. Only enemies that are already alert are redirected, never dormant ones.
+- **Friendly fire** is judged by the attacker's game (aim line for shots, reach and facing for
+  melee) and applied by the victim's game through the game's own damage functions. Shots are
+  not yet checked for walls in between.
 
 `core.lua` is hot-reloaded when it changes, so the mod can be developed with the game running.
 

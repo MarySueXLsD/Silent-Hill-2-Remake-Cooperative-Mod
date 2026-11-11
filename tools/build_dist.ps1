@@ -30,6 +30,9 @@ New-Item -ItemType Directory -Force (Join-Path $mod 'Scripts'), (Join-Path $mod 
 Copy-Item (Join-Path $root 'CoopGhost\Scripts\main.lua'), (Join-Path $root 'CoopGhost\Scripts\core.lua') (Join-Path $mod 'Scripts')
 Copy-Item (Join-Path $root 'CoopGhost\enabled.txt') $mod
 Copy-Item (Join-Path $root 'README.md') (Join-Path $out 'README.txt')
+# Russian install guide for the other player, with a BOM so Notepad shows Cyrillic on any Windows
+$ru = Get-Content (Join-Path $root 'docs\INSTALL_RU.md') -Raw -Encoding UTF8
+[IO.File]::WriteAllText((Join-Path $out 'README_RU.txt'), $ru, (New-Object Text.UTF8Encoding($true)))
 
 $zip = Join-Path $dist 'CoopGhost.zip'
 if (Test-Path $zip) { Remove-Item $zip -Confirm:$false }

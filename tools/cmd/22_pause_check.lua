@@ -1,0 +1,5 @@
+local pawn = getPawn()
+local statics = UEHelpers.GetGameplayStatics()
+local world = pawn:GetWorld()
+P("paused:", tostring(statics:IsGamePaused(world)), " time dilation:", statics:GetGlobalTimeDilation(world))
+P(string.format("world time %.3f  real time %.3f  frames drawn %s  last frame %.1fs ago", statics:GetTimeSeconds(world), statics:GetRealTimeSeconds(world), tostring(S.frameCount), os.clock() - (S.lastFrame or 0)))
