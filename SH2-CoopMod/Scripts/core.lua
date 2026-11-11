@@ -25,7 +25,7 @@
 local ctx = ...
 local UEHelpers = ctx.UEHelpers
 local log = ctx.log
-local VERSION = "0.20"
+local VERSION = "0.21"
 
 local DIR = ctx.root .. "\\ipc"
 local OUT_FILE = DIR .. "\\out.txt"
@@ -411,7 +411,7 @@ local function handleEvent(pawn, text)
         onRemoteLoaded(pawn, tonumber(rest:match("^(%d+)$")))
         return
     elseif kind == "died" then
-        onRemoteDied(pawn)
+        onRemoteDied(pawn, tonumber(rest:match("^(%d+)$")))   -- the host adds which load it died in
         return
     elseif kind == "ereact" then
         local id, code = rest:match("^(%x+) (%d)$")
@@ -1811,6 +1811,10 @@ local function onLoadedHere(pawn)
     local viaMenu = S.joinedViaMenu   -- we just loaded the host's save from the main menu
     S.joinedViaMenu = nil
     S.loadGen = (S.loadGen or 1) + 1
+    -- The host is at a save again, whoever asked for it (the game does it by itself after a
+    -- death): a restart that was still waiting has nothing left to do. The joiner's has: it
+    -- still has to get into the host's load.
+    if S.role ~= "join" then S.restart = nil end
     if S.role == "join" then
         S.loadedOnOurOwn = not viaMenu or nil   -- a load that did not come from the host; see the tick
         if viaMenu or on("sync_saves") then
@@ -1830,6 +1834,9 @@ local MESSAGES = {
     peer_died = { "Other player died, restarting...", "Другой игрок погиб, перезапуск..." },
     you_died = { "You died, both players restart...", "Ты погиб, оба игрока начинают заново..." },
     host_loaded = { "The host loaded a save, joining...", "Хост загрузил сохранение, подключаемся..." },
+    version = { "Mod versions differ: other player %s, you %s. Both need the same one.",
+        "Версии мода разные: у другого игрока %s, у тебя %s. Нужна одинаковая." },
+    older = { "older than 0.21", "старее 0.21" },
 }
 
 local function hideMessage()
@@ -1838,9 +1845,15 @@ local function hideMessage()
     if t and t:IsValid() then pcall(function() t:SetVisibility(1) end) end   -- 1 = collapsed
 end
 
-local function showMessage(key, seconds)
+-- Extra arguments fill the %s places of the message.
+local function showMessage(key, seconds, ...)
     local pair = MESSAGES[key]
     if not pair then return end
+    local line = S.menuRussian and pair[2] or pair[1]
+    if select("#", ...) > 0 then
+        local okFormat, formatted = pcall(string.format, line, ...)
+        if okFormat then line = formatted end
+    end
     local hud = FindFirstOf("SHGameplayHudWidget")
     if not (hud and hud:IsValid()) then return end
     local text = S.msgText
@@ -1872,9 +1885,36 @@ local function showMessage(key, seconds)
         end)
         S.msgText, S.msgHud = text, hud:GetAddress()
     end
-    pcall(function() text:SetText(FText(S.menuRussian and pair[2] or pair[1])) end)
+    pcall(function() text:SetText(FText(line)) end)
     pcall(function() text:SetVisibility(3) end)   -- 3 = shown, and never in the way of the mouse
     S.msgUntil = os.clock() + (seconds or 4)
+end
+
+-- Both games must run the same version of the mod. A newer one sends things an older one does
+-- not understand and simply skips, so everything looks connected while half of it does nothing
+-- (a 0.20 host with a 0.16 joiner: no shared death, no enemy deaths, no following the host's
+-- loads, and nothing saying why). Every packet names its version since 0.21; a packet without
+-- one is older. A difference is said out loud: in the log, and on screen when the other player
+-- connects and every couple of minutes after that.
+local function versionTick()
+    if S.mirror or not peer.connected or not peer.version then return end
+    if peer.version == VERSION then
+        S.versionSaid = nil
+        return
+    end
+    local now = os.clock()
+    local theirs = peer.version
+    if S.versionSaid ~= theirs then
+        S.versionSaid = theirs
+        S.versionShowAt = now
+        log("the other player's game runs " .. (theirs == "?" and "a version of the mod older than 0.21" or ("version " .. theirs))
+            .. ", this one runs " .. VERSION .. "; both must run the same one, or much of the mod does nothing")
+    end
+    if now >= (S.versionShowAt or 0) and not S.restart then
+        S.versionShowAt = now + 120
+        if theirs == "?" then theirs = S.menuRussian and MESSAGES.older[2] or MESSAGES.older[1] end
+        showMessage("version", 12, theirs, VERSION)
+    end
 end
 
 -- ================================================================ dying together
@@ -1883,21 +1923,30 @@ end
 -- why. The host reloads its last save; the joiner then joins that load like any other, so both
 -- are in exactly the same state again.
 
-onRemoteDied = function(pawn)
+onRemoteDied = function(pawn, gen)
     if not on("shared_death") or S.restart then return end
-    S.restart = { why = "peer", at = os.clock(), hostGen = peer.gen }
+    -- `gen` is the load the host died in, said by the host itself: by the time this message
+    -- arrives its packets may already carry the next load's number.
+    S.restart = { why = "peer", at = os.clock(), hostGen = gen or peer.gen }
     showMessage("peer_died", 8)
     log("the other player died; both players restart")
 end
 
 local function deathTick(pawn)
-    if S.deathSeen then return end
     local dead = false
     pcall(function() dead = tonumber(pawn.Health:GetHealthState()) == 4 end)   -- 4 = death
-    if not dead then return end
+    if not dead then
+        -- Alive for a moment: whatever death we noted is behind us, so the next one counts
+        -- again. (0.20 only cleared the note on a load it noticed, and missed most of them.)
+        S.aliveLooks = (S.aliveLooks or 0) + 1
+        if S.aliveLooks >= 6 then S.deathSeen = nil end
+        return
+    end
+    S.aliveLooks = 0
+    if S.deathSeen then return end
     S.deathSeen = true
     if not (on("shared_death") and peer.connected and not S.mirror) then return end
-    enqueue("died")
+    enqueue(S.role == "join" and "died" or ("died " .. (S.loadGen or 1)))
     if not S.restart then S.restart = { why = "self", at = os.clock(), hostGen = peer.gen } end
     log("you died; both players restart")
 end
@@ -1912,6 +1961,15 @@ local function restartTick(pawn)
     if S.role == "join" then
         rejoinHost(r.why == "self" and "you died" or "the host died", (r.hostGen or 0) + 1)
     else
+        local p = getPawn()
+        if not p then return end   -- a load is under way, or we are at the menu: nothing to reload
+        if r.why == "self" then
+            -- After its own death the game goes back to the last save by itself once the
+            -- player presses on. If it has, we are alive again and must not reload on top of it.
+            local dead = false
+            pcall(function() dead = tonumber(p.Health:GetHealthState()) == 4 end)
+            if not dead then return end
+        end
         log("restarting from the last save")
         risky("reload", "last save", function() UEHelpers.GetGameInstance():ReloadGame(false, "", false, nil, 0) end)
     end
@@ -1927,10 +1985,10 @@ end
 -- hash of their level path names them on both PCs.
 
 S.puzzleState = S.puzzleState or {}     -- id -> solved?
-S.solvedRemote = S.solvedRemote or {}   -- id -> true, solved by the other player
+S.solvedRemote = S.solvedRemote or {}   -- id -> { tries, nextAt }: solved by the other player, still to be solved here
 
 onRemoteSolved = function(id)
-    S.solvedRemote[id] = true
+    S.solvedRemote[id] = { tries = 0, nextAt = 0 }
     S.puzzlesDue = true
 end
 
@@ -1956,12 +2014,33 @@ local function puzzlesTick(pawn)
                 else
                     -- solved by the other player: solve it here too, unless we are in the middle
                     -- of working on it ourselves (then wait until we step away)
-                    if S.solvedRemote[id] and not solved and not comp:IsShown() then
+                    local want = S.solvedRemote[id]
+                    if want == true then   -- left by a version before 0.21, across a hot reload
+                        want = { tries = 0, nextAt = 0 }
+                        S.solvedRemote[id] = want
+                    end
+                    if want and solved then
+                        S.solvedRemote[id] = nil
+                    elseif want and not comp:IsShown() and now >= want.nextAt then
                         pcall(function() comp:SetSolved() end)
                         solved = comp:IsSolved()
-                        S.puzzleState[id] = true
-                        log("a puzzle the other player solved is now solved here" .. (solved and "" or " (the game did not accept it)"))
-                        if solved then S.solvedRemote[id] = nil end
+                        S.puzzleState[id] = true   -- theirs either way: not something to report back
+                        if solved then
+                            S.solvedRemote[id] = nil
+                            log("a puzzle the other player solved is now solved here")
+                        else
+                            -- Not everything that calls itself solved lets itself be solved from
+                            -- outside. A few more tries, further and further apart, then leave it:
+                            -- 0.20 asked again on every pass, for good.
+                            want.tries = want.tries + 1
+                            if want.tries >= 4 then
+                                S.solvedRemote[id] = nil
+                                log("a puzzle the other player solved cannot be solved from here; leaving it")
+                            else
+                                want.nextAt = now + 5 * want.tries * want.tries
+                                if want.tries == 1 then log("a puzzle the other player solved did not take here yet; trying again later") end
+                            end
+                        end
                     end
                     local known = S.puzzleState[id]
                     if known == nil then
@@ -2141,20 +2220,27 @@ local function findEnemy(id)
 end
 
 -- Send an enemy after the other player's body, or let it go back to its own judgement.
-local function forceOntoAvatar(e, st, yes)
+-- A change stands for a couple of seconds before the next one is allowed: an enemy handed back
+-- and forth several times a second goes for nobody. `atOnce` skips that wait, for an enemy
+-- that died or a player who is no longer there.
+local function forceOntoAvatar(e, st, yes, atOnce)
+    if (yes == true) == (st.forced == true) then return end
     local ctl = e.actor.Controller
     if not (ctl and ctl:IsValid()) then return end
+    if not atOnce and os.clock() - (st.switchedAt or -100) < 2.0 then return end
     if yes then
-        if st.forced or not (S.avatar and S.avatar:IsValid()) then return end
+        if not (S.avatar and S.avatar:IsValid()) then return end
         local ok = pcall(function() ctl:SetForcedEnemy(S.avatar) end)
         if ok then
             st.forced = true
+            st.switchedAt = os.clock()
             log("an enemy now hunts the other player")
         end
-    elseif st.forced then
+    else
         pcall(function() ctl:SetForcedEnemy(nil) end)
         pcall(function() ctl:ClearForceChase() end)
         st.forced = nil
+        st.switchedAt = os.clock()
         log("an enemy stopped hunting the other player")
     end
 end
@@ -2270,13 +2356,17 @@ local function enemiesTick(pawn)
                 end
 
                 if isHost then
-                    -- The host decides who each enemy is after.
+                    -- The host decides who each enemy is after. The rule that gives an enemy to
+                    -- the other player and the rule that takes it back must never both hold:
+                    -- in 0.20 they could (the other game reports the enemy as theirs while we
+                    -- are the closer one), and the enemy changed hands on every pass.
+                    local weAreCloser = dMe + ENEMY_SWITCH < dOther
                     if not alive or not other or dOther > ENEMY_RANGE then
-                        forceOntoAvatar(e, st, false)
+                        forceOntoAvatar(e, st, false, true)
                     elseif st.forced then
                         -- back to us once we are clearly the closer one
-                        if dMe + ENEMY_SWITCH < dOther then forceOntoAvatar(e, st, false) end
-                    elseif huntsMe or hunted[e.id] then
+                        if weAreCloser then forceOntoAvatar(e, st, false) end
+                    elseif (huntsMe or hunted[e.id]) and not weAreCloser then
                         -- Only enemies that are already alert in one of the games are redirected,
                         -- never sleeping ones. They go after the other player when only that
                         -- player's game has noticed them, or when that player is clearly closer.
@@ -2289,7 +2379,7 @@ local function enemiesTick(pawn)
                     if huntsMe and alive and #huntedOut < ENEMY_MAX then huntedOut[#huntedOut + 1] = e.id end
                     local t = theirCopy
                     if t then
-                        forceOntoAvatar(e, st, alive and t.target == "h")
+                        forceOntoAvatar(e, st, alive and t.target == "h", not alive)
                         if t.hp > 0 and alive and t.hp ~= hp and not hasPendingDamage(e.id) then
                             pcall(function() e.health:SetHealth(t.hp) end)
                             st.hp = e.health:GetHealth()
@@ -2785,6 +2875,7 @@ local function writeOut(pawn)
     local lines = { string.format("S %s %d %.1f %.1f %.1f %.1f %.1f %d %s %d",
         S.session, S.seq, loc.X, loc.Y, loc.Z, rot.Yaw, speed, peer.applied, S.role,
         math.floor(os.clock() * 1000)) }
+    lines[#lines + 1] = "V " .. VERSION   -- since 0.21; older versions skip lines they do not know
 
     local okPose, pose = pcall(capturePose, pawn)
     if okPose then
@@ -2864,6 +2955,7 @@ local function readIn(pawn)
     local loopback = false
     local snap = nil
     local doorsSeen, enemiesSeen, huntedSeen, pushingSeen = {}, {}, {}, {}
+    local versionSeen = nil
     for line in text:gmatch("[^\r\n]+") do
         if first then
             first = false
@@ -2911,6 +3003,8 @@ local function readIn(pawn)
         elseif line:sub(1, 2) == "F " then
             local flOn, fp, fy = line:match("^F (%d) (%-?%d+) (%-?%d+)")
             if snap and flOn then snap.fl, snap.fp, snap.fy = tonumber(flOn), tonumber(fp), tonumber(fy) end
+        elseif line:sub(1, 2) == "V " then
+            versionSeen = line:match("^V (%S+)")
         elseif line:sub(1, 2) == "M " then
             peer.model = line:match("^M (%w+)")
         elseif line:sub(1, 2) == "D " then
@@ -2952,6 +3046,7 @@ local function readIn(pawn)
             peer.enemies = enemiesSeen   -- host's enemies (empty when they are the joiner)
             peer.hunted = huntedSeen     -- enemies hunting them in their own game
             peer.pushing = pushingSeen   -- objects they are pushing right now
+            peer.version = versionSeen or "?"   -- "?": a packet without one, so older than 0.21
         end
     end
 end
@@ -3237,6 +3332,50 @@ end
 
 -- ================================================================ entry points
 
+-- Telling that a load has happened, and starting over after one. (One table for the helpers:
+-- Lua allows a file only 200 top-level locals.)
+local LOAD = {}
+
+-- Everything the mod remembers about the level that has just been unloaded.
+function LOAD.forget()
+    S.avatar = nil
+    S.snaps = {}
+    S.known = nil   -- the inventory is rebuilt on load; start over when the player is back
+    S.doors, S.doorState = {}, {}   -- doors are reloaded with the level, so forget what we held
+    S.cutPlayers, S.cutPlaying, S.cutRequest, S.cutExpected, S.regroupAt = {}, nil, nil, nil, nil
+    S.itemState, S.takenRemote, S.itemSeen, S.itemSince, S.doorSeen = {}, {}, nil, nil, nil
+    S.enemies, S.enemyState, S.enemyDead, S.spawnerById, S.spawnTried = {}, {}, {}, {}, {}
+    S.puzzleState, S.solvedRemote, S.puzzleSeen, S.puzzleSince = {}, {}, nil, nil
+    S.pushables, S.pushState, S.pushRemote, S.pushSeen = {}, {}, {}, nil
+    S.deathSeen, S.msgText, S.msgUntil = nil, nil, nil
+    S.trigQueue, S.trigPending, S.trigSent, S.trigInside, S.useQueue, S.usePending = {}, {}, {}, {}, {}, {}
+    S.myEnemies, S.myHunted, S.myDoors, S.myPushing = nil, nil, nil, nil
+end
+
+-- A load normally shows as a stretch without a player: the menu, a loading screen. A reload of
+-- the level we are already in does not have to. After a death, or "load last save", the game
+-- is busy for the whole reload, and the next time the mod looks there is a player again: a new
+-- one, in a new world. Version 0.20 only knew the first kind and so never noticed these: it
+-- kept its list of dead enemies, its inventory count and its "we are dead" flag from before
+-- the reload, and never told the other player that the host was in another load.
+-- So the world itself is asked: a different world object, or its clock (which counts from
+-- zero in every freshly loaded world) running backwards, means a load went by.
+function LOAD.restarted(pawn)
+    local world, clock
+    pcall(function() world = pawn:GetWorld():GetAddress() end)
+    pcall(function()
+        if not (S.ksl and S.ksl:IsValid()) then S.ksl = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary") end
+        clock = S.ksl:GetGameTimeInSeconds(pawn)
+    end)
+    local wasWorld, wasClock = S.worldAddr, S.worldClock
+    if world then S.worldAddr = world end
+    if clock then S.worldClock = clock end
+    if S.pawnGone then return false end   -- that load was seen the usual way
+    if world and wasWorld and world ~= wasWorld then return true end
+    if clock and wasClock and clock + 1.0 < wasClock then return true end
+    return false
+end
+
 -- ~30x a second, called by main.lua: measure ourselves and exchange messages.
 local function tick()
     pcall(runCmd)
@@ -3248,19 +3387,10 @@ local function tick()
 
     local pawn = getPawn()
     if not pawn then
-        S.avatar = nil
-        S.snaps = {}
-        S.known = nil   -- the inventory is rebuilt on load; start over when the player is back
-        S.doors, S.doorState = {}, {}   -- doors are reloaded with the level, so forget what we held
-        S.cutPlayers, S.cutPlaying, S.cutRequest, S.cutExpected, S.regroupAt = {}, nil, nil, nil, nil
-        S.itemState, S.takenRemote, S.itemSeen, S.itemSince, S.doorSeen = {}, {}, nil, nil, nil
-        S.enemies, S.enemyState, S.enemyDead, S.spawnerById, S.spawnTried = {}, {}, {}, {}, {}
-        S.puzzleState, S.solvedRemote, S.puzzleSeen, S.puzzleSince = {}, {}, nil, nil
-        S.pushables, S.pushState, S.pushRemote, S.pushSeen = {}, {}, {}, nil
-        S.deathSeen, S.msgText, S.msgUntil = nil, nil, nil
-        S.trigQueue, S.trigPending, S.trigSent, S.trigInside, S.useQueue, S.usePending = {}, {}, {}, {}, {}, {}
+        LOAD.forget()
         pcall(riskTick, true)
         S.pawnGone = true   -- menu, loading screen or death: the next time we exist, a load has finished
+        S.worldAddr, S.worldClock = nil, nil
         local okMenu, errMenu = pcall(menuTick)
         if not okMenu then warnOnce("menu:" .. tostring(errMenu), "main menu error: " .. tostring(errMenu)) end
         return
@@ -3270,6 +3400,13 @@ local function tick()
     local whole = pcall(function() assert(pawn.Mesh:IsValid() and pawn.Items:IsValid() and pawn.Health:IsValid()) end)
     if not whole then return end
     S.tickCount = S.tickCount + 1
+
+    if LOAD.restarted(pawn) then
+        log("the game reloaded without leaving the level; starting over from the new load")
+        LOAD.forget()
+        pcall(riskTick, true)
+        S.pawnGone = true
+    end
 
     if S.pawnGone or not S.loadedAt then
         S.loadedAt = os.clock()
@@ -3321,6 +3458,10 @@ local function tick()
         pcall(function() pawn.CharacterMovement:SetMovementMode(1, 0) end)   -- 1 = walking
     end
     if S.tickCount % 30 == 1 then readRole() end
+    if S.tickCount % 30 == 17 then
+        local ok, err = pcall(versionTick)
+        if not ok then warnOnce("version:" .. tostring(err), "version check error: " .. tostring(err)) end
+    end
 
     if S.tickCount % 30 == 1 then readConfig() end
 

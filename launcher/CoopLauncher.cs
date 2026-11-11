@@ -7,7 +7,8 @@
 // Screenshots for the README: CoopLauncher.exe --screenshots <folder> [--scale 1.25]
 // Testing: CoopLauncher.exe --session <host|join>,<peer ip>[,<port>] starts a session at once, off
 // screen, without touching the saved settings; --save-into <folder> puts a fetched save and a
-// launcher.log there instead of in the game's save folder.
+// launcher.log there instead of in the game's save folder; --game <folder> uses that as the game
+// folder for the test session (messages then go to the log instead of into message boxes).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -46,6 +47,7 @@ namespace SH2CoopMod
                 if (args[i] == "--scale") float.TryParse(args[i + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out forcedScale);
                 if (args[i] == "--session") MainForm.TestSession = args[i + 1];
                 if (args[i] == "--save-into") MainForm.TestSaveDir = args[i + 1];
+                if (args[i] == "--game") MainForm.TestGame = args[i + 1];
             }
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) Theme.Scale = g.DpiX / 96f;
             if (forcedScale > 0.5f) Theme.Scale = forcedScale;
@@ -507,7 +509,7 @@ namespace SH2CoopMod
 
     class MainForm : Form
     {
-        const string Version = "0.20";
+        const string Version = "0.21";
         const string Author = "MarySue";
         const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
@@ -554,8 +556,12 @@ namespace SH2CoopMod
         long lastRecvTicks;
         TcpListener saveListener;
         volatile bool fetching;
+        // Which version of the mod each game says it runs, read from the packets going through
+        // (null until one has been seen; "" for a packet without a version, so older than 0.21).
+        volatile string localModVersion, peerModVersion;
+        string versionsSaid;
 
-        public static string TestSession, TestSaveDir;   // see the top of this file
+        public static string TestSession, TestSaveDir, TestGame;   // see the top of this file
 
         static int D(int v) { return Theme.D(v); }
 
@@ -619,6 +625,7 @@ namespace SH2CoopMod
                 SetRole(t[0] == "join");
                 if (t.Length > 1) ipBox.Value = t[1];
                 if (t.Length > 2) portBox.Value = t[2];
+                if (TestGame != null) gameBox.Value = TestGame;
                 launchGame.Checked = false;
                 StartPosition = FormStartPosition.Manual;
                 Location = new Point(-30000, -30000);
@@ -1020,7 +1027,7 @@ namespace SH2CoopMod
         void FillDemo()
         {
             gameStatus.Text = "\u25CF  Game found"; gameStatus.SetRole(Role.Good);
-            modStatus.Text = "\u25CF  Mod installed"; modStatus.SetRole(Role.Good);
+            modStatus.Text = "\u25CF  Mod " + Version + " installed"; modStatus.SetRole(Role.Good);
             ipBox.Value = "26.91.33.150"; nameBox.Value = "Player";
             netStatus.Text = "Connected   (sent 30/s, received 30/s)"; netStatus.SetRole(Role.Good);
             sideStatus.Text = "\u25CF  Connected"; sideStatus.SetRole(Role.Good);
@@ -1048,6 +1055,47 @@ namespace SH2CoopMod
         static bool IsLink(string dir) { return Directory.Exists(dir) && (new DirectoryInfo(dir).Attributes & FileAttributes.ReparsePoint) != 0; }
         static bool GameRunning { get { return Process.GetProcessesByName("SHProto-Win64-Shipping").Length > 0; } }
 
+        // The launcher is what a player downloads; the mod is what the game runs. They are not
+        // the same thing until "Install / update mod" has been pressed, and a new launcher over
+        // an old mod is how two players end up on different versions without anything saying
+        // so. So the mod's own version is read from the file the game loads.
+        static string ModVersionIn(string modDir)
+        {
+            try
+            {
+                using (StreamReader sr = new StreamReader(Path.Combine(modDir, @"Scripts\core.lua")))
+                {
+                    for (int i = 0; i < 200; i++)
+                    {
+                        string line = sr.ReadLine();
+                        if (line == null) break;
+                        if (!line.StartsWith("local VERSION")) continue;
+                        int a = line.IndexOf('"'), b = a < 0 ? -1 : line.IndexOf('"', a + 1);
+                        if (b > a) return line.Substring(a + 1, b - a - 1);
+                    }
+                }
+            }
+            catch { }
+            return "";
+        }
+        string InstalledModVersion { get { return ModVersionIn(ModDir); } }
+        string PayloadModVersion { get { return ModVersionIn(Path.Combine(PayloadDir, @"ue4ss\Mods\SH2-CoopMod")); } }
+
+        // Negative when a is the older version. One that cannot be read counts as oldest.
+        static int CompareVersions(string a, string b)
+        {
+            string[] pa = a.Split('.'), pb = b.Split('.');
+            for (int i = 0; i < Math.Max(pa.Length, pb.Length); i++)
+            {
+                int na = 0, nb = 0;
+                if (i < pa.Length) int.TryParse(pa[i], out na);
+                if (i < pb.Length) int.TryParse(pb[i], out nb);
+                if (na != nb) return na < nb ? -1 : 1;
+            }
+            return 0;
+        }
+        static string NameVersion(string v) { return string.IsNullOrEmpty(v) ? "an old version" : "version " + v; }
+
         void RefreshGameStatus()
         {
             if (demo) return;
@@ -1060,8 +1108,54 @@ namespace SH2CoopMod
             gameStatus.Text = "\u25CF  Game found"; gameStatus.SetRole(Role.Good);
             bool payload = Directory.Exists(PayloadDir);
             if (IsLink(ModDir)) { modStatus.Text = "\u25CF  Mod installed (development link)"; modStatus.SetRole(Role.Good); installBtn.Enabled = false; }
-            else if (ModInstalled) { modStatus.Text = "\u25CF  Mod installed"; modStatus.SetRole(Role.Good); installBtn.Enabled = payload; }
+            else if (ModInstalled)
+            {
+                string have = InstalledModVersion, bring = payload ? PayloadModVersion : "";
+                int order = payload ? CompareVersions(have, bring) : 0;
+                if (order < 0) { modStatus.Text = "\u25CF  Mod " + (have.Length > 0 ? have : "(old)") + " installed, update to " + bring; modStatus.SetRole(Role.Warn); }
+                else if (order > 0) { modStatus.Text = "\u25CF  Mod " + have + " installed, newer than this launcher"; modStatus.SetRole(Role.Warn); }
+                else { modStatus.Text = "\u25CF  Mod " + have + " installed"; modStatus.SetRole(Role.Good); }
+                installBtn.Enabled = payload;
+            }
             else { modStatus.Text = payload ? "\u25CF  Mod not installed" : "\u25CF  Mod not installed (game_files folder missing)"; modStatus.SetRole(Role.Warn); installBtn.Enabled = payload; }
+        }
+
+        // A message box, or the log when the launcher runs unattended (testing).
+        void Tell(string text)
+        {
+            if (TestSession != null) Log(text.Replace("\r", "").Replace("\n", " "));
+            else MessageBox.Show(this, text, "SH2-CoopMod");
+        }
+
+        // Before a session starts: the game must have the mod this launcher brings. An older one
+        // is replaced here and now, so that "download the new zip and press Start" is all an
+        // update takes. False when the session should not start.
+        bool EnsureModCurrent()
+        {
+            if (IsLink(ModDir) || !Directory.Exists(PayloadDir)) return true;
+            string have = InstalledModVersion, bring = PayloadModVersion;
+            int order = CompareVersions(have, bring);
+            if (order > 0)
+            {
+                Log("The mod in the game folder (" + have + ") is newer than this launcher (" + bring + "). Use the newest launcher.");
+                return true;
+            }
+            if (order == 0) return true;
+            if (GameRunning)
+            {
+                Tell("The mod in the game folder is " + NameVersion(have) + "; this launcher brings version " + bring + ".\n\n" +
+                    "Close the game, then press Start session again. The mod is updated first. Both players must be on the same version.");
+                return false;
+            }
+            Log("The mod in the game folder is " + NameVersion(have) + "; updating it to version " + bring + ".");
+            InstallMod();
+            if (IsDisposed) return false;   // restarting as administrator to be allowed to copy
+            if (CompareVersions(InstalledModVersion, bring) < 0)
+            {
+                Tell("The mod in the game folder could not be updated to " + bring + ".\n\nPress Install / update mod on the Session page, with the game closed.");
+                return false;
+            }
+            return true;
         }
 
         // ------------------------------------------------------------ settings
@@ -1268,6 +1362,7 @@ namespace SH2CoopMod
         {
             if (!GameFound) { ShowPage(0); MessageBox.Show(this, "Choose the game folder first.", "SH2-CoopMod"); return; }
             if (!ModInstalled) { MessageBox.Show(this, "Install the mod first.", "SH2-CoopMod"); return; }
+            if (!EnsureModCurrent()) return;
             IPAddress peer;
             if (!IPAddress.TryParse(ipBox.Value.Trim(), out peer) || peer.AddressFamily != AddressFamily.InterNetwork)
             {
@@ -1295,6 +1390,7 @@ namespace SH2CoopMod
             catch (Exception ex) { Log("Cannot open UDP port " + port + ": " + ex.Message + " (is another launcher or relay running?)"); return; }
 
             sentCount = 0; recvCount = 0; lastRecvTicks = 0;
+            localModVersion = null; peerModVersion = null; versionsSaid = null;
             relayRun = true;
             IPEndPoint peerEp = new IPEndPoint(peer, port);
             string ipc = IpcDir;
@@ -1382,6 +1478,7 @@ namespace SH2CoopMod
                             byte[] bytes = enc.GetBytes(text);
                             udp.Send(bytes, bytes.Length, peer);
                             lastSent = text;
+                            localModVersion = PacketVersion(text);
                             Interlocked.Increment(ref sentCount);
                         }
                     }
@@ -1406,6 +1503,7 @@ namespace SH2CoopMod
                     }
                     if (latest != null && latest.StartsWith("S ") && latest.Length < 60000)
                     {
+                        peerModVersion = PacketVersion(latest);
                         try { File.WriteAllText(inFile, latest, enc); } catch (IOException) { }
                     }
                     Thread.Sleep(10);
@@ -1413,6 +1511,15 @@ namespace SH2CoopMod
             }
             catch (Exception ex) { Log("Relay stopped: " + ex.Message); }
             finally { try { udp.Close(); } catch { } }
+        }
+
+        // The mod names its version in every packet, on a line of its own ("V 0.21"), since 0.21.
+        static string PacketVersion(string packet)
+        {
+            int at = packet.IndexOf("\nV ");
+            if (at < 0) return "";
+            int end = packet.IndexOf('\n', at + 3);
+            return (end < 0 ? packet.Substring(at + 3) : packet.Substring(at + 3, end - at - 3)).Trim();
         }
 
         // ------------------------------------------------------------ joining from the main menu
@@ -1600,12 +1707,31 @@ namespace SH2CoopMod
             int r = Interlocked.Exchange(ref recvCount, 0);
             long last = Interlocked.Read(ref lastRecvTicks);
             string state; Role role;
-            if (last != 0 && (DateTime.UtcNow.Ticks - last) < TimeSpan.TicksPerSecond * 3) { state = "Connected"; role = Role.Good; }
+            string side = null;
+            if (last != 0 && (DateTime.UtcNow.Ticks - last) < TimeSpan.TicksPerSecond * 3)
+            {
+                state = "Connected"; role = Role.Good;
+                // Connected is not the same as working: two different versions of the mod talk
+                // past each other, each skipping what it does not know.
+                string mine = localModVersion, theirs = peerModVersion;
+                if (mine != null && theirs != null && mine != theirs)
+                {
+                    state = "Connected, versions differ"; side = "Versions differ"; role = Role.Warn;
+                    string pair = mine + "|" + theirs;
+                    if (versionsSaid != pair)
+                    {
+                        versionsSaid = pair;
+                        Log("The two games run different versions of the mod: yours " + (mine.Length > 0 ? mine : "older than 0.21") +
+                            ", the other player's " + (theirs.Length > 0 ? theirs : "older than 0.21") + ". Much of the mod does nothing until they match.");
+                        Log("Whoever has the older one: close the game, get the newest launcher and press Start session. It updates the mod first.");
+                    }
+                }
+            }
             else if (!GameRunning) { state = "Waiting for the game"; role = Role.Warn; }
             else if (s == 0) { state = "Game running, load a save"; role = Role.Warn; }
             else { state = "No answer from the other player"; role = Role.Bad; }
             netStatus.Text = state + "   (sent " + s + "/s, received " + r + "/s)"; netStatus.SetRole(role);
-            sideStatus.Text = "\u25CF  " + state; sideStatus.SetRole(role);
+            sideStatus.Text = "\u25CF  " + (side ?? state); sideStatus.SetRole(role);
         }
 
         // ------------------------------------------------------------ README screenshots
