@@ -11,9 +11,9 @@
 ## Как скачать мод
 
 1. Открой в браузере эту ссылку, скачивание начнётся само:
-   https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest/download/SH2-CoopMod.zip
+   https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod/releases/latest/download/SH2-CoopMod.zip
 2. Если скачивание не началось, открой страницу
-   https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest
+   https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod/releases/latest
    и внизу, в разделе «Assets», нажми на файл SH2-CoopMod.zip.
 3. Файл окажется в папке «Загрузки». Браузер может спросить, сохранять ли файл.
    Нажми «Сохранить».

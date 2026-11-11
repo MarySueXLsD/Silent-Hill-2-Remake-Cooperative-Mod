@@ -509,7 +509,7 @@ namespace SH2CoopMod
     {
         const string Version = "0.16";
         const string Author = "MarySue";
-        const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin";
+        const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
 
         static readonly string[] ModelKeys = { "james", "maria", "angela", "mary" };

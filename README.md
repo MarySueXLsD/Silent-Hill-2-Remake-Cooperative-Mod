@@ -127,7 +127,7 @@ All tweaks apply immediately, also while the game is running.
 
 ## Play
 
-1. Download [`SH2-CoopMod.zip` from the latest release](https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest/download/SH2-CoopMod.zip),
+1. Download [`SH2-CoopMod.zip` from the latest release](https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod/releases/latest/download/SH2-CoopMod.zip),
    unzip it anywhere and run `CoopLauncher.exe`. (Or build it yourself with
    `tools\build_dist.ps1`, see below.) A step-by-step guide in Russian is in
    [docs/INSTALL_RU.md](docs/INSTALL_RU.md) and inside the zip as `README_RU.txt`.
