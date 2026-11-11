@@ -1,4 +1,4 @@
--- CoopGhost bootstrap.
+-- SH2-CoopMod bootstrap.
 -- Stays tiny and stable. The actual mod lives in core.lua, which this file loads and then
 -- reloads automatically whenever core.lua changes on disk (no game restart needed).
 --
@@ -6,8 +6,8 @@
 
 local UEHelpers = require("UEHelpers")
 
-CoopGhost = CoopGhost or {}          -- global on purpose: survives core reloads
-CoopGhost.state = CoopGhost.state or {}
+SH2CoopMod = SH2CoopMod or {}          -- global on purpose: survives core reloads
+SH2CoopMod.state = SH2CoopMod.state or {}
 
 local function modRoot()
     local src = debug.getinfo(1, "S").source or ""
@@ -17,7 +17,7 @@ end
 local ROOT = modRoot()
 local CORE = ROOT .. "\\Scripts\\core.lua"
 
-local function log(s) print("[CoopGhost] " .. tostring(s) .. "\n") end
+local function log(s) print("[SH2-CoopMod] " .. tostring(s) .. "\n") end
 
 local loadedSrc = nil
 local function loadCore()
@@ -29,10 +29,10 @@ local function loadCore()
     loadedSrc = src
     local chunk, err = load(src, "@core.lua")
     if not chunk then log("core.lua does not compile: " .. tostring(err)) return end
-    if CoopGhost.impl and CoopGhost.impl.shutdown then pcall(CoopGhost.impl.shutdown) end
+    if SH2CoopMod.impl and SH2CoopMod.impl.shutdown then pcall(SH2CoopMod.impl.shutdown) end
     local ok, impl = pcall(chunk, { root = ROOT, UEHelpers = UEHelpers, log = log })
     if ok and type(impl) == "table" then
-        CoopGhost.impl = impl
+        SH2CoopMod.impl = impl
         log("core loaded (" .. tostring(impl.version) .. ")")
     else
         log("core.lua failed to start: " .. tostring(impl))
@@ -47,11 +47,11 @@ LoopAsync(33, function()
     ExecuteInGameThread(function()
         n = n + 1
         if n % 30 == 1 then pcall(loadCore) end
-        local impl = CoopGhost.impl
+        local impl = SH2CoopMod.impl
         if impl and impl.tick then
             local ok, err = pcall(impl.tick)
-            if not ok and CoopGhost.lastTickError ~= err then
-                CoopGhost.lastTickError = err
+            if not ok and SH2CoopMod.lastTickError ~= err then
+                SH2CoopMod.lastTickError = err
                 log("tick error: " .. tostring(err))
             end
         end
@@ -61,7 +61,7 @@ LoopAsync(33, function()
 end)
 
 RegisterKeyBind(Key.F9, function()
-    local impl = CoopGhost.impl
+    local impl = SH2CoopMod.impl
     if impl and impl.onKey then pcall(impl.onKey, "F9") end
 end)
 

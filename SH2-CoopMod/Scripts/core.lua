@@ -1,4 +1,4 @@
--- CoopGhost core - two-player sync for a single-player game.
+-- SH2-CoopMod core - co-op for a single-player game.
 -- Loaded (and hot-reloaded on change) by main.lua. Returns a table of entry points.
 --
 -- Each player runs their own copy of the game. This mod keeps the two copies in agreement by
@@ -25,7 +25,7 @@
 local ctx = ...
 local UEHelpers = ctx.UEHelpers
 local log = ctx.log
-local VERSION = "0.14"
+local VERSION = "0.15"
 
 local DIR = ctx.root .. "\\ipc"
 local OUT_FILE = DIR .. "\\out.txt"
@@ -42,7 +42,7 @@ local HELD_EVERY = 10        -- ticks between checks of what we are holding (~33
 local MIRROR_OFFSET = 150    -- solo test: the copy stands this far to the side
 
 -- Everything that must survive a hot reload lives in S.
-local S = CoopGhost.state
+local S = SH2CoopMod.state
 if not S.session then
     math.randomseed(os.time())
     S.session = string.format("%06x", math.random(0, 0xFFFFFF))
@@ -137,7 +137,7 @@ local function enqueue(text)
     S.nextEventId = S.nextEventId + 1
 end
 
-local getPC = rawget(_G, "CoopGhost_GetPC") or UEHelpers.GetPlayerController
+local getPC = rawget(_G, "SH2CoopMod_GetPC") or UEHelpers.GetPlayerController
 local function getPawn()
     local pc = getPC()
     if not pc or not pc:IsValid() then return nil end
@@ -1465,7 +1465,7 @@ end
 local function tryInstallRegroupKey()
     if S.regroupKeyF7 or S.regroupKeyFailed then return end
     local ok, err = pcall(RegisterKeyBind, Key.F7, function()
-        local impl = CoopGhost.impl
+        local impl = SH2CoopMod.impl
         if impl and impl.onKey then pcall(impl.onKey, "F7") end
     end)
     if ok then S.regroupKeyF7 = true else S.regroupKeyFailed = true log("F7 could not be bound: " .. tostring(err)) end
@@ -1517,7 +1517,7 @@ local function tryInstallSaveHooks()
         local ok = pcall(RegisterHook, "/Script/GameBase.GameBaseStatics:" .. fn, function(_, _, firstParam)
             local slot = -1
             if fn == "MakeFullSave" then pcall(function() slot = math.floor(firstParam:get()) end) end
-            local impl = CoopGhost.impl
+            local impl = SH2CoopMod.impl
             if impl and impl.onLocalSave then pcall(impl.onLocalSave, fn, slot) end
         end)
         S.saveHooks[fn] = ok
@@ -1902,7 +1902,7 @@ local MELEE_HOOK = "/Script/SHProto.SHMeleeCmbSubcomp:OnMeleeAttackEnd"
 local function tryInstallMeleeHook()
     if S.meleeHooked or S.meleeHookFailed then return end
     local ok, err = pcall(RegisterHook, MELEE_HOOK, function()
-        local impl = CoopGhost.impl
+        local impl = SH2CoopMod.impl
         if impl and impl.onMelee then pcall(impl.onMelee) end
     end)
     if ok then
@@ -2361,7 +2361,7 @@ local FRAME_HOOK = "/Game/Game/Characters/Humans/JamesSunderland/Animation/Anima
 local function tryInstallFrameHook()
     if S.frameHooked then return end
     local ok, err = pcall(RegisterHook, FRAME_HOOK, function()
-        local impl = CoopGhost.impl
+        local impl = SH2CoopMod.impl
         if impl and impl.onFrame then impl.onFrame() end
     end)
     if ok then

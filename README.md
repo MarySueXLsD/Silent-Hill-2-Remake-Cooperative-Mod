@@ -1,51 +1,47 @@
-# CoopGhost
+# SH2-CoopMod
 
-**Experimental two-player co-op for Silent Hill 2 (2024), with a launcher.** Authored by MarySue.
+**Co-op mod for Silent Hill 2 (2024): play the whole game together with a friend.** Authored by MarySue.
 
-The game has no multiplayer. CoopGhost lets two people play side by side anyway: each runs their
-own copy of the game, and the mod keeps the two copies in agreement over Radmin VPN, Hamachi or
-a LAN. You see the other player in your world, fully animated, holding what they hold, with their
-flashlight lighting your surroundings, and you share one inventory.
+The game has no multiplayer. SH2-CoopMod adds it. Two players go through the campaign side by
+side, each on their own PC, connected over Radmin VPN, Hamachi or a LAN. You see each other
+fully animated, share one inventory and fight the same enemies, and when one of you solves a
+puzzle or triggers a cutscene the story moves on for both.
 
 > Unofficial fan project. Not affiliated with or endorsed by the game's developer or publisher.
 > You need your own copy of the game. This repository contains no game files.
 
 ![Session page](docs/screenshots/session.png)
 
-## Status
+## What is shared
 
-This is a work in progress. Everything marked working has been tested by one player against a
-simulated second player; a full session between two real PCs still needs testing.
-
-| Feature | Status |
+| | |
 |---|---|
-| Other player visible, full-body animation mirrored every frame | Working |
-| Equipped weapon, flashlight and radio shown on the other player | Working |
-| Other player's flashlight beam lights your world | Working |
-| Shared inventory (ammo, healing, documents, key items), each kind switchable | Working |
-| Doors react to the other player's body, and open, close and unlock for both players | Reaction and remote moves tested solo; needs a two-PC test |
-| Cutscenes: both players watch together, then the joiner regroups beside the host | Detection runs; joining and regrouping need a two-PC test |
-| World pickups: taken once for both players (with shared inventory) | Tracking runs; removal needs a two-PC test |
-| Collision with the other player (optional) | Working |
-| Friendly fire (optional): a melee hit costs about one enemy hit, a shot double | Damage path tested; hit detection needs a two-PC test |
-| Play as James, Maria, Angela or Mary, for the other player and on your own screen | Working, poses on non-James bodies are approximate |
-| Launcher: host / join, install, live tweaks, themes | Working, network path needs a two-PC test |
-| Health | Separate on purpose |
-| Map and item-inspection screens | Separate (they are local menus) |
-| Shared enemies: same health and deaths, agreed targets, joiner follows the host's positions | Tracking and sending run; damage sharing, retargeting and position following need a two-PC test |
-| Enemies from scripted groups and bosses | Not synced |
-| Puzzles: solved by one player, solved for both (safes, padlocks, door locks, cabinet puzzles) | Tracking runs; solving the other player's copy needs a two-PC test |
-| Puzzle progress short of solved (pieces placed, dials turned) | Not synced; one player does the puzzle |
-| Pushable objects: furniture one player pushes moves for both | Built from the game's class layout; not yet tried on a real object |
-| Saving and loading together: the joiner saves when the host saves and reloads when the host loads | Save hooks installed; saving and reloading the joiner need a two-PC test |
-| Go to the other player (F7 in game, or the launcher button) | Working |
-| Sliding doors | Unlocks shared; opening and closing not synced |
-| Plain switches, item containers, elevators, breakable glass | Not synced; use F7 if an elevator or a drop separates you |
-| Save points, boss fights, companion characters, endings tracking | Not synced |
+| **The other player** | Visible in your world with full-body animation, their equipped weapon, flashlight and radio, and a real flashlight beam that lights your surroundings |
+| **Inventory** | One inventory for both: ammunition, healing items, documents, weapons, keys and puzzle items. Each kind can be switched off |
+| **Pickups** | An item taken by one player is taken for both |
+| **Puzzles** | Solved by one player, solved for both: safes, padlocks, door locks, cabinet puzzles, valves |
+| **Doors** | Open, close and unlock for both, and react to the other player walking through |
+| **Pushable objects** | Furniture one player pushes moves for both |
+| **Cutscenes** | Both players watch together, then carry on side by side where the host is |
+| **Enemies** | Same health and deaths for both, and they hunt whichever player is closer |
+| **Saving and loading** | The joiner saves when the host saves, and loads when the host loads |
+| **Characters** | Play as James, Maria, Angela or Mary, for the other player and on your own screen |
 
-The intended way to play: both players share one inventory, one of them works a puzzle with
-the items you found, and when it is solved the story moves on for both. Play through the same areas together and it holds up; drift apart and the worlds
-diverge.
+Kept separate on purpose: health, and the map and item-inspection screens.
+Optional extras: collision between the players, and friendly fire.
+
+The intended way to play: you share one inventory, one of you works a puzzle with the items you
+found, and when it is solved the story moves on for both.
+
+## Known limits
+
+- The mod is new. Most of it has been checked by one player against a simulated partner, and
+  full two-player sessions have had little testing so far. Please report what breaks.
+- Not shared yet: half-finished puzzle progress (one player does the puzzle), enemies from
+  scripted groups and bosses, sliding doors opening and closing, plain switches, item
+  containers and elevators. Press **F7** to jump to the other player if something separates you.
+- If the host deliberately loads an older save slot, the joiner gets their own latest save.
+- Both players need the same game build and should start from the same point in the game.
 
 ## The launcher
 
@@ -109,7 +105,7 @@ All tweaks apply immediately, also while the game is running.
 
 ## Play
 
-1. Download [`CoopGhost.zip` from the latest release](https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest/download/CoopGhost.zip),
+1. Download [`SH2-CoopMod.zip` from the latest release](https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest/download/SH2-CoopMod.zip),
    unzip it anywhere and run `CoopLauncher.exe`. (Or build it yourself with
    `tools\build_dist.ps1`, see below.) A step-by-step guide in Russian is in
    [docs/INSTALL_RU.md](docs/INSTALL_RU.md) and inside the zip as `README_RU.txt`.
@@ -136,7 +132,7 @@ The game ships without any networking, and Lua inside UE4SS has no sockets, so t
  (mod)       ipc\                                                          ipc\       (mod)
 ```
 
-- **The mod** (`CoopGhost\Scripts\core.lua`) runs inside each game. About 30 times a second it
+- **The mod** (`SH2-CoopMod\Scripts\core.lua`) runs inside each game. About 30 times a second it
   measures the local player (position, 27 bone rotations, held items, flashlight) and writes
   that to `ipc\out.txt`. It reads the other player's state from `ipc\in.txt`.
 - **The launcher** carries those small text packets between the PCs over UDP.
@@ -193,22 +189,22 @@ Requirements: Windows with .NET Framework 4 (for the bundled C# compiler) and Po
 powershell -ExecutionPolicy Bypass -File tools\build_dist.ps1
 ```
 
-This compiles the launcher and assembles `dist\CoopGhost\` and `dist\CoopGhost.zip`. It copies
+This compiles the launcher and assembles `dist\SH2-CoopMod\` and `dist\SH2-CoopMod.zip`. It copies
 UE4SS from your own game folder, so install UE4SS into the game first.
 
 Regenerate the README screenshots (demo data, no personal settings) with:
 
 ```powershell
-dist\CoopGhost\CoopLauncher.exe --screenshots docs\screenshots --scale 1.25
+dist\SH2-CoopMod\CoopLauncher.exe --screenshots docs\screenshots --scale 1.25
 ```
 
 ## Project layout
 
 | Path | What |
 |---|---|
-| `CoopGhost\Scripts\main.lua` | Tiny bootstrap; reloads `core.lua` whenever it changes |
-| `CoopGhost\Scripts\core.lua` | The mod |
-| `CoopGhost\relay.ps1` | Script version of the launcher's network relay, kept as a fallback |
+| `SH2-CoopMod\Scripts\main.lua` | Tiny bootstrap; reloads `core.lua` whenever it changes |
+| `SH2-CoopMod\Scripts\core.lua` | The mod |
+| `SH2-CoopMod\relay.ps1` | Script version of the launcher's network relay, kept as a fallback |
 | `launcher\CoopLauncher.cs` | The launcher (WinForms, custom-drawn, single file) |
 | `tools\build_dist.ps1` | Builds the launcher and the distributable zip |
 | `tools\run.ps1`, `tools\cmd\` | Run Lua snippets inside the live game; the probes used to map it |

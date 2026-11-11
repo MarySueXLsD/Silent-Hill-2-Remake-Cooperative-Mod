@@ -1,7 +1,7 @@
 # Solo test of shared inventory: pretends to be the other player by writing in.txt by hand.
 # Leaves the inventory as it found it. Needs the game running with a save loaded, relay NOT running.
 $root = Split-Path $PSScriptRoot -Parent
-$ipc = Join-Path $root 'CoopGhost\ipc'
+$ipc = Join-Path $root 'SH2-CoopMod\ipc'
 $run = Join-Path $PSScriptRoot 'run.ps1'
 function Game($file) { powershell -NoProfile -ExecutionPolicy Bypass -File $run -LuaFile (Join-Path $PSScriptRoot "cmd\$file") }
 function Out { Get-Content (Join-Path $ipc 'out.txt') }

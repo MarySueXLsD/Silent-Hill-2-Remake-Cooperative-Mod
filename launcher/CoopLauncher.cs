@@ -1,4 +1,4 @@
-// CoopGhost launcher - authored by MarySue.
+// SH2-CoopMod launcher - authored by MarySue.
 // Host or join a session, pick the game folder, change co-op tweaks and characters, pick a theme.
 // Also carries the mod's messages between the two PCs over UDP.
 //
@@ -19,7 +19,7 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-namespace CoopGhost
+namespace SH2CoopMod
 {
     static class Native
     {
@@ -136,7 +136,7 @@ namespace CoopGhost
             }
         }
 
-        // The app's mark: two figures, the second one fainter - you and the other player.
+        // The app's mark: two figures side by side - you and the other player.
         public static void DrawMark(Graphics g, RectangleF r, Color front, Color back)
         {
             float s = r.Height;
@@ -241,7 +241,7 @@ namespace CoopGhost
         }
     }
 
-    enum Kind { Primary, Ghost, Nav, Chip, Tile, Min, Close }
+    enum Kind { Primary, Outline, Nav, Chip, Tile, Min, Close }
 
     class Btn : Control, IThemed
     {
@@ -285,7 +285,7 @@ namespace CoopGhost
                     font = Theme.F(14f, true);
                     break;
                 }
-                case Kind.Ghost:
+                case Kind.Outline:
                 {
                     Color fill = Theme.Mix(bg, p.Text, down ? 0.14f : hot ? 0.09f : 0.04f);
                     Theme.FillRound(g, r, Theme.Df(8), fill, p.Border, 1f);
@@ -501,7 +501,7 @@ namespace CoopGhost
 
     class MainForm : Form
     {
-        const string Version = "0.14";
+        const string Version = "0.15";
         const string Author = "MarySue";
         const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
@@ -563,7 +563,7 @@ namespace CoopGhost
         public MainForm(bool demo)
         {
             this.demo = demo;
-            Text = "CoopGhost";
+            Text = "SH2-CoopMod";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(D(940), D(760));
@@ -636,7 +636,7 @@ namespace CoopGhost
             HookDrag(side);
 
             MarkBox mark = new MarkBox(); mark.SetBounds(D(22), D(26), D(40), D(32)); side.Controls.Add(mark); HookDrag(mark);
-            Lbl name = new Lbl("CoopGhost", Role.Text, 18f, true); name.Location = new Point(D(70), D(22)); side.Controls.Add(name); HookDrag(name);
+            Lbl name = new Lbl("SH2-CoopMod", Role.Text, 18f, true); name.Location = new Point(D(70), D(22)); side.Controls.Add(name); HookDrag(name);
             Lbl sub = new Lbl("co-op launcher", Role.Muted, 11.5f, false); sub.Location = new Point(D(71), D(46)); side.Controls.Add(sub); HookDrag(sub);
 
             nav = new Btn[PageNames.Length];
@@ -789,10 +789,10 @@ namespace CoopGhost
         {
             Card game = PutCard(p, "Game", 0, 0, 682, 122);
             gameBox = PutInput(game, 16, 38, 536);
-            Btn browse = PutBtn(game, "Browse\u2026", Kind.Ghost, 562, 38, 104, 32);
+            Btn browse = PutBtn(game, "Browse\u2026", Kind.Outline, 562, 38, 104, 32);
             gameStatus = Put(game, "", Role.Muted, 12.5f, false, 16, 86);
             modStatus = Put(game, "", Role.Muted, 12.5f, false, 150, 86);
-            installBtn = PutBtn(game, "Install / update mod", Kind.Ghost, 506, 80, 160, 30);
+            installBtn = PutBtn(game, "Install / update mod", Kind.Outline, 506, 80, 160, 30);
 
             connCard = PutCard(p, "Connection", 0, 134, 682, 178);
             hostBtn = PutBtn(connCard, "Host", Kind.Chip, 16, 38, 110, 32);
@@ -807,13 +807,13 @@ namespace CoopGhost
             addrLabel = Put(connCard, "Your addresses (click to copy):", Role.Muted, 11.5f, false, 16, 146);
 
             startBtn = PutBtn(p, "Start session", Kind.Primary, 0, 324, 170, 44);
-            stopBtn = PutBtn(p, "Stop", Kind.Ghost, 180, 324, 90, 44);
+            stopBtn = PutBtn(p, "Stop", Kind.Outline, 180, 324, 90, 44);
             stopBtn.Enabled = false;
             Put(p, "Start the game too", Role.Text, 13f, false, 338, 337);
             launchGame = new Toggle(); launchGame.Location = new Point(D(290), D(335)); p.Controls.Add(launchGame);
             launchGame.CheckedChanged += OnSettingChanged;
 
-            Btn regroup = PutBtn(p, "Go to other player (F7)", Kind.Ghost, 494, 324, 186, 44);
+            Btn regroup = PutBtn(p, "Go to other player (F7)", Kind.Outline, 494, 324, 186, 44);
             regroup.Click += delegate
             {
                 // The mod picks this file up within a second and moves the player in game.
@@ -966,13 +966,13 @@ namespace CoopGhost
         {
             Card c = PutCard(p, null, 0, 0, 682, 286);
             MarkBox mark = new MarkBox(); mark.SetBounds(D(24), D(26), D(74), D(58)); c.Controls.Add(mark);
-            Put(c, "CoopGhost", Role.Text, 28f, true, 112, 22);
-            Put(c, "Version " + Version + "  \u00B7  launcher and co-op mod", Role.Muted, 12.5f, false, 114, 62);
+            Put(c, "SH2-CoopMod", Role.Text, 28f, true, 112, 22);
+            Put(c, "Version " + Version + "  \u00B7  co-op mod and launcher", Role.Muted, 12.5f, false, 114, 62);
             Put(c, "Authored by " + Author, Role.Accent, 16f, true, 24, 108);
-            PutWrapped(c, "Two-player sync for a single-player game. Each player runs their own copy; the mod keeps position, animation, held items, flashlight and inventory in agreement over Radmin VPN, Hamachi or LAN.",
+            PutWrapped(c, "Co-op mod for Silent Hill 2 (2024). Play the whole game together: you see each other, share one inventory, fight the same enemies, and puzzles, doors and cutscenes move on for both. Works over Radmin VPN, Hamachi or LAN.",
                 Role.Text, 13f, 24, 142, 634, 64);
-            Btn repo = PutBtn(c, "Open GitHub page", Kind.Ghost, 24, 226, 170, 36);
-            Btn folder = PutBtn(c, "Open mod folder", Kind.Ghost, 204, 226, 160, 36);
+            Btn repo = PutBtn(c, "Open GitHub page", Kind.Outline, 24, 226, 170, 36);
+            Btn folder = PutBtn(c, "Open mod folder", Kind.Outline, 204, 226, 160, 36);
             repo.Click += delegate { try { Process.Start(RepoUrl); } catch { } };
             folder.Click += delegate { try { if (Directory.Exists(ModDir)) Process.Start(ModDir); } catch { } };
 
@@ -1010,7 +1010,7 @@ namespace CoopGhost
 
         string GamePath { get { return gameBox.Value.Trim(); } }
         string Win64Dir { get { return Path.Combine(GamePath, @"SHProto\Binaries\Win64"); } }
-        string ModDir { get { return Path.Combine(Win64Dir, @"ue4ss\Mods\CoopGhost"); } }
+        string ModDir { get { return Path.Combine(Win64Dir, @"ue4ss\Mods\SH2-CoopMod"); } }
         string IpcDir { get { return Path.Combine(ModDir, "ipc"); } }
         string PayloadDir { get { return Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "game_files"); } }
         bool GameFound { get { try { return File.Exists(Path.Combine(GamePath, "SHProto.exe")); } catch { return false; } } }
@@ -1040,7 +1040,7 @@ namespace CoopGhost
         {
             get
             {
-                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CoopGhost");
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SH2-CoopMod");
                 Directory.CreateDirectory(dir);
                 return Path.Combine(dir, "launcher.ini");
             }
@@ -1177,7 +1177,7 @@ namespace CoopGhost
             foreach (string text in list)
             {
                 string ip = text.Split(' ')[0];
-                Btn b = new Btn(text, Kind.Ghost);
+                Btn b = new Btn(text, Kind.Outline);
                 int w = TextRenderer.MeasureText(text, Theme.F(13f, false)).Width + D(22);
                 if (x + w > limit) break;
                 b.SetBounds(x, D(138), w, D(28));
@@ -1194,7 +1194,7 @@ namespace CoopGhost
         bool OfferElevation(string what)
         {
             DialogResult r = MessageBox.Show(this, what + "\n\nWindows protects this folder. Restart the launcher as administrator?",
-                "CoopGhost", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                "SH2-CoopMod", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (r != DialogResult.Yes) return false;
             try
             {
@@ -1219,7 +1219,7 @@ namespace CoopGhost
         void InstallMod()
         {
             if (!GameFound || !Directory.Exists(PayloadDir)) return;
-            if (GameRunning) { MessageBox.Show(this, "Close the game before installing or updating the mod.", "CoopGhost"); return; }
+            if (GameRunning) { MessageBox.Show(this, "Close the game before installing or updating the mod.", "SH2-CoopMod"); return; }
             try
             {
                 CopyDir(PayloadDir, Win64Dir);
@@ -1236,12 +1236,12 @@ namespace CoopGhost
 
         void StartSession()
         {
-            if (!GameFound) { ShowPage(0); MessageBox.Show(this, "Choose the game folder first.", "CoopGhost"); return; }
-            if (!ModInstalled) { MessageBox.Show(this, "Install the mod first.", "CoopGhost"); return; }
+            if (!GameFound) { ShowPage(0); MessageBox.Show(this, "Choose the game folder first.", "SH2-CoopMod"); return; }
+            if (!ModInstalled) { MessageBox.Show(this, "Install the mod first.", "SH2-CoopMod"); return; }
             IPAddress peer;
             if (!IPAddress.TryParse(ipBox.Value.Trim(), out peer) || peer.AddressFamily != AddressFamily.InterNetwork)
             {
-                MessageBox.Show(this, "Enter the other player's IP address (for Radmin VPN it starts with 26.).", "CoopGhost");
+                MessageBox.Show(this, "Enter the other player's IP address (for Radmin VPN it starts with 26.).", "SH2-CoopMod");
                 return;
             }
             bool join = joinBtn.Selected;

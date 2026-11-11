@@ -1,4 +1,4 @@
-# Builds dist\CoopGhost\ (launcher + everything that goes into a game folder) and dist\CoopGhost.zip.
+# Builds dist\SH2-CoopMod\ (launcher + everything that goes into a game folder) and dist\SH2-CoopMod.zip.
 #   CoopLauncher.exe          the launcher (compiled here from launcher\CoopLauncher.cs)
 #   game_files\               copied into <game>\SHProto\Binaries\Win64 by the launcher's Install button
 #   README.txt
@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $dist = Join-Path $root 'dist'
-$out = Join-Path $dist 'CoopGhost'
+$out = Join-Path $dist 'SH2-CoopMod'
 if (Test-Path $out) { Remove-Item $out -Recurse -Force -Confirm:$false }
 $files = Join-Path $out 'game_files'
 New-Item -ItemType Directory -Force $files | Out-Null
@@ -25,16 +25,16 @@ Copy-Item (Join-Path $GameWin64 'dwmapi.dll') $files
 robocopy (Join-Path $GameWin64 'ue4ss') (Join-Path $files 'ue4ss') /E /XJ /XD CXXHeaderDump /XF UE4SS.log *.dmp /NFL /NDL /NJH /NJS | Out-Null
 
 # the mod itself, as a real copy
-$mod = Join-Path $files 'ue4ss\Mods\CoopGhost'
+$mod = Join-Path $files 'ue4ss\Mods\SH2-CoopMod'
 New-Item -ItemType Directory -Force (Join-Path $mod 'Scripts'), (Join-Path $mod 'ipc') | Out-Null
-Copy-Item (Join-Path $root 'CoopGhost\Scripts\main.lua'), (Join-Path $root 'CoopGhost\Scripts\core.lua') (Join-Path $mod 'Scripts')
-Copy-Item (Join-Path $root 'CoopGhost\enabled.txt') $mod
+Copy-Item (Join-Path $root 'SH2-CoopMod\Scripts\main.lua'), (Join-Path $root 'SH2-CoopMod\Scripts\core.lua') (Join-Path $mod 'Scripts')
+Copy-Item (Join-Path $root 'SH2-CoopMod\enabled.txt') $mod
 Copy-Item (Join-Path $root 'README.md') (Join-Path $out 'README.txt')
 # Russian install guide for the other player, with a BOM so Notepad shows Cyrillic on any Windows
 $ru = Get-Content (Join-Path $root 'docs\INSTALL_RU.md') -Raw -Encoding UTF8
 [IO.File]::WriteAllText((Join-Path $out 'README_RU.txt'), $ru, (New-Object Text.UTF8Encoding($true)))
 
-$zip = Join-Path $dist 'CoopGhost.zip'
+$zip = Join-Path $dist 'SH2-CoopMod.zip'
 if (Test-Path $zip) { Remove-Item $zip -Confirm:$false }
 Compress-Archive -Path $out -DestinationPath $zip
 "built $out"

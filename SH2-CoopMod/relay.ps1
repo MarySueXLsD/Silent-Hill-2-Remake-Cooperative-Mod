@@ -1,4 +1,4 @@
-# CoopGhost relay - carries the mod's messages between the two PCs.
+# SH2-CoopMod relay - carries the mod's messages between the two PCs.
 # Works over any network where the PCs can reach each other by IP: Radmin VPN, Hamachi, LAN.
 #
 # Run it on BOTH PCs, each pointing at the OTHER one's VPN address. One side is the host
@@ -26,7 +26,7 @@ $peer = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($PeerIP),
 $any = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
 $enc = [System.Text.Encoding]::ASCII
 
-Write-Host "CoopGhost relay ($Role): sending to ${PeerIP}:$Port, listening on UDP $Port"
+Write-Host "SH2-CoopMod relay ($Role): sending to ${PeerIP}:$Port, listening on UDP $Port"
 Write-Host "Folder: $dir"
 
 $lastSent = ''

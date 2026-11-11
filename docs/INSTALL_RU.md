@@ -1,4 +1,4 @@
-# CoopGhost: как установить мод для совместной игры
+# SH2-CoopMod: как установить мод для совместной игры
 
 Мод позволяет проходить Silent Hill 2 (ремейк) вдвоём. Каждый играет на своём компьютере,
 а мод связывает две игры между собой.
@@ -11,18 +11,18 @@
 ## Как скачать мод
 
 1. Открой в браузере эту ссылку, скачивание начнётся само:
-   https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest/download/CoopGhost.zip
+   https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest/download/SH2-CoopMod.zip
 2. Если скачивание не началось, открой страницу
    https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin/releases/latest
-   и внизу, в разделе «Assets», нажми на файл CoopGhost.zip.
+   и внизу, в разделе «Assets», нажми на файл SH2-CoopMod.zip.
 3. Файл окажется в папке «Загрузки». Браузер может спросить, сохранять ли файл.
    Нажми «Сохранить».
 
 ## Установка (делается один раз)
 
-1. Найди скачанный архив CoopGhost.zip в папке «Загрузки» и распакуй его в любое место,
+1. Найди скачанный архив SH2-CoopMod.zip в папке «Загрузки» и распакуй его в любое место,
    например на Рабочий стол: правой кнопкой по архиву, затем «Извлечь всё».
-2. Открой папку CoopGhost и запусти файл CoopLauncher.exe.
+2. Открой папку SH2-CoopMod и запусти файл CoopLauncher.exe.
    Если появится синее окно «Система Windows защитила ваш компьютер», нажми «Подробнее»,
    а потом «Выполнить в любом случае».
 3. В верхнем блоке GAME нажми кнопку «Browse…» и выбери папку с игрой. Это та папка,

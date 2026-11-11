@@ -2,8 +2,8 @@
 dist/
 
 # runtime files written while the game and launcher run
-CoopGhost/ipc/
-CoopGhost/config.txt
+SH2-CoopMod/ipc/
+SH2-CoopMod/config.txt
 
 # captured probe output
 *.out.txt

@@ -1,4 +1,4 @@
-# Dev helper: run a Lua file inside the running game through the CoopGhost dev channel
+# Dev helper: run a Lua file inside the running game through the SH2-CoopMod dev channel
 # and print what it reported.   Usage: tools\run.ps1 tools\cmd\something.lua [-TimeoutSec 20]
 #   -Legacy  talk to the pre-hot-reload mod (reads cmd.lua instead of run.lua)
 param(
@@ -6,7 +6,7 @@ param(
     [int]$TimeoutSec = 20,
     [switch]$Legacy
 )
-$dir = Join-Path (Split-Path $PSScriptRoot -Parent) 'CoopGhost\ipc'
+$dir = Join-Path (Split-Path $PSScriptRoot -Parent) 'SH2-CoopMod\ipc'
 $cmd = Join-Path $dir $(if ($Legacy) { 'cmd.lua' } else { 'run.lua' })
 $res = Join-Path $dir 'result.txt'
 $tmp = Join-Path $dir 'cmd.tmp'
