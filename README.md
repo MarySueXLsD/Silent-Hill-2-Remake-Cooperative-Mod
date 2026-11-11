@@ -12,16 +12,12 @@ puzzle or triggers a cutscene the story moves on for both.
 
 ## Preview
 
-![Two players exploring together](docs/preview/two-players-lobby.webp)
-
 | | |
 |---|---|
 | ![The other player, seen from the front](docs/preview/two-players-front.webp) | ![Both players holding their weapons](docs/preview/held-weapons.webp) |
 | ![Playing as different characters, outdoors](docs/preview/characters-outdoors.webp) | ![Playing as different characters, indoors](docs/preview/characters-indoors.webp) |
 
 Joining is one entry in the game's own main menu, **Join co-op**:
-
-![The Join co-op entry in the game's main menu](docs/preview/join-coop-menu.jpg)
 
 | Host not in the game yet | Host in the game |
 |---|---|
