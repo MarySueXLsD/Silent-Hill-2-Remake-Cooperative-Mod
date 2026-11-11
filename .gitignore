@@ -1,0 +1,9 @@
+# build output (contains UE4SS binaries copied from a game folder)
+dist/
+
+# runtime files written while the game and launcher run
+CoopGhost/ipc/
+CoopGhost/config.txt
+
+# captured probe output
+*.out.txt
