@@ -25,7 +25,7 @@
 local ctx = ...
 local UEHelpers = ctx.UEHelpers
 local log = ctx.log
-local VERSION = "0.16"
+local VERSION = "0.17"
 
 local DIR = ctx.root .. "\\ipc"
 local OUT_FILE = DIR .. "\\out.txt"
@@ -244,7 +244,7 @@ local function onRemoteInvFull(pawn, list)
 end
 
 local onRemoteLock, onRemoteFriendlyFire, onRemoteCutscene, onRemoteTook, onRemoteEnemyDamage, onRemoteSolved, onRemotePush   -- defined further down
-local onRemoteSaved, onRemoteLoaded
+local onRemoteSaved, onRemoteLoaded, onRemoteEnemyDead
 
 local function handleEvent(pawn, text)
     local kind, rest = text:match("^(%S+)%s*(.*)$")
@@ -261,6 +261,10 @@ local function handleEvent(pawn, text)
     elseif kind == "solved" then
         local id = rest:match("^(%x+)$")
         if id and on("sync_puzzles") then onRemoteSolved(id) end
+        return
+    elseif kind == "edead" then
+        local id = rest:match("^(%x+)$")
+        if id then onRemoteEnemyDead(id) end
         return
     elseif kind == "edmg" then
         local id, amount = rest:match("^(%x+) (%d+)$")
@@ -1646,25 +1650,79 @@ local ENEMY_SWITCH = 200     -- how much closer the other player must be before 
 S.enemies = S.enemies or {}        -- loaded: { id, actor, health }
 S.enemyState = S.enemyState or {}  -- id -> { hp = last seen, forced = true when sent after the avatar }
 
+S.enemyDead = S.enemyDead or {}    -- id -> true: dead in one of the games, so dead in both
+S.spawnerById = S.spawnerById or {}
+S.spawnTried = S.spawnTried or {}  -- id -> when we last asked its spawner to spawn
+
 local function scanEnemies()
-    local list = {}
+    local list, byId = {}, {}
     local spawners = FindAllOf("SHAISpawner")
     if spawners then
         for i = 1, #spawners do
             local sp = spawners[i]
             if sp:IsValid() then
+                local path = sp:GetFullName():match("^%S+%s+(.+)$") or sp:GetFullName()
+                local id = hashName(path)
+                byId[id] = sp
                 local actor = sp:GetSpawnedActor()
                 if actor and actor:IsValid() then
                     local health = actor.healthComponent
                     if health and health:IsValid() then
-                        local path = sp:GetFullName():match("^%S+%s+(.+)$") or sp:GetFullName()
-                        list[#list + 1] = { id = hashName(path), actor = actor, health = health }
+                        list[#list + 1] = { id = id, actor = actor, health = health }
                     end
                 end
             end
         end
     end
     S.enemies = list
+    S.spawnerById = byId
+end
+
+-- An enemy died in the other game: it dies here too. The health component's own calls mark it
+-- dead and switch its collision off, but on their own they can leave the body standing, so a
+-- moment later a body that is not playing its death is simply taken out of sight.
+local function killHere(pawn, e, st)
+    local from = (S.avatar and S.avatar:IsValid()) and S.avatar or pawn
+    pcall(function() e.health:ReceiveDamage(e.health:GetHealth() + 1, from) end)
+    local dead = false
+    pcall(function() dead = e.health:IsDead() end)
+    if not dead then pcall(function() e.health:Kill() end) end
+    pcall(function() st.hp = e.health:GetHealth() end)
+    st.forced = nil
+    st.tidyAt = os.clock() + 1.5
+    log("an enemy the other player killed died here too")
+end
+
+local function tidyBody(e, st)
+    st.tidyAt = nil
+    local dying = false
+    pcall(function() dying = e.actor.AnimComponent:IsInDeathState(true) end)
+    if dying then return end
+    pcall(function()
+        e.actor:SetActorEnableCollision(false)
+        e.actor:SetActorHiddenInGame(true)
+    end)
+end
+
+-- The other game has a live enemy that does not exist here (a scene spawned it there, or only
+-- that player walked into its area): have its spawner make it here as well.
+local function spawnMissing(theirs, known)
+    local now = os.clock()
+    for id, t in pairs(theirs) do
+        if t.hp > 0 and not known[id] and not S.enemyDead[id] and now - (S.spawnTried[id] or -100) > 10 then
+            local sp = S.spawnerById[id]
+            if sp and sp:IsValid() then
+                local fresh = false
+                pcall(function() fresh = sp._Spawned == 0 and sp._Enabled == true end)
+                if fresh then
+                    S.spawnTried[id] = now
+                    local ok = pcall(function() sp:Spawn() end)
+                    log(ok and "spawned an enemy that only the other player had" or "could not spawn an enemy the other player has")
+                    S.enemiesDue = true   -- look for its actor on the next pass
+                end
+            end
+        end
+    end
 end
 
 local function findEnemy(id)
@@ -1721,23 +1779,43 @@ local function enemiesTick(pawn)
     local isHost = S.role ~= "join" or S.mirror
     local theirs = peer.enemies or {}
     local hunted = peer.hunted or {}
-    local mineOut, huntedOut = {}, {}
+    local mineOut, deadOut, huntedOut, known = {}, {}, {}, {}
 
     for _, e in ipairs(S.enemies) do
         local actor = e.actor
         if actor:IsValid() and e.health:IsValid() then
+            known[e.id] = true
             local loc = actor:K2_GetActorLocation()
             local dMe = dist3(me.X, me.Y, me.Z, loc.X, loc.Y, loc.Z)
             local dOther = other and dist3(other.x, other.y, other.z, loc.X, loc.Y, loc.Z) or math.huge
             local st = S.enemyState[e.id]
+            local hp = e.health:GetHealth()
+            local theirCopy = theirs[e.id]
+
+            -- Dead in the other game means dead here, wherever it is. (Their packets list the
+            -- dead ones near them, and every death is also sent once as a reliable event.)
+            if hp > 0 and not S.mirror and (S.enemyDead[e.id] or (theirCopy and theirCopy.hp <= 0)) then
+                if not st then st = {} S.enemyState[e.id] = st end
+                S.enemyDead[e.id] = true
+                if os.clock() - (st.killTried or -100) > 5 then   -- an enemy that cannot die yet is retried, not hammered
+                    st.killTried = os.clock()
+                    killHere(pawn, e, st)
+                    hp = e.health:GetHealth()
+                end
+            end
+            if st and st.tidyAt and os.clock() >= st.tidyAt then tidyBody(e, st) end
+
             if dMe < ENEMY_RANGE or dOther < ENEMY_RANGE or (st and st.forced) then
                 if not st then st = {} S.enemyState[e.id] = st end
-                local hp = e.health:GetHealth()
 
                 -- damage we dealt here since the last look
                 if st.hp and hp < st.hp and not S.mirror then
                     enqueue(string.format("edmg %s %d", e.id, math.ceil(st.hp - hp)))
+                    if st.hp > 0 and hp <= 0 and not S.enemyDead[e.id] then
+                        enqueue("edead " .. e.id)   -- we killed it; gets through even if they are far away
+                    end
                 end
+                if hp <= 0 then S.enemyDead[e.id] = true end
                 st.hp = hp
 
                 local alive = hp > 0
@@ -1764,22 +1842,14 @@ local function enemiesTick(pawn)
                             forceOntoAvatar(e, st, true)
                         end
                     end
-                    if #mineOut < ENEMY_MAX then
-                        mineOut[#mineOut + 1] = string.format("%s:%d:%d:%d:%d:%s", e.id, math.floor(loc.X), math.floor(loc.Y),
-                            math.floor(loc.Z), math.floor(hp), st.forced and "j" or (huntsMe and "h" or "n"))
-                    end
                 else
                     -- The joiner follows the host's copy.
                     if huntsMe and alive and #huntedOut < ENEMY_MAX then huntedOut[#huntedOut + 1] = e.id end
-                    local t = theirs[e.id]
+                    local t = theirCopy
                     if t then
                         forceOntoAvatar(e, st, alive and t.target == "h")
-                        if t.hp ~= hp and not hasPendingDamage(e.id) then
-                            if t.hp <= 0 and alive then
-                                pcall(function() e.health:Kill() end)
-                            elseif t.hp > 0 and alive then
-                                pcall(function() e.health:SetHealth(t.hp) end)
-                            end
+                        if t.hp > 0 and alive and t.hp ~= hp and not hasPendingDamage(e.id) then
+                            pcall(function() e.health:SetHealth(t.hp) end)
                             st.hp = e.health:GetHealth()
                         end
                         if alive then
@@ -1793,11 +1863,28 @@ local function enemiesTick(pawn)
                         end
                     end
                 end
+
+                -- Both games list what they have, so the other one can spawn what it lacks and
+                -- learn of deaths. Live enemies first; the dead fill what room is left.
+                local entry = string.format("%s:%d:%d:%d:%d:%s", e.id, math.floor(loc.X), math.floor(loc.Y), math.floor(loc.Z),
+                    math.floor(hp), (isHost and st.forced) and "j" or (huntsMe and "h" or "n"))
+                if alive then mineOut[#mineOut + 1] = entry else deadOut[#deadOut + 1] = entry end
             end
         end
     end
+    while #mineOut > ENEMY_MAX do mineOut[#mineOut] = nil end
+    for i = 1, #deadOut do
+        if #mineOut >= ENEMY_MAX + 4 then break end
+        mineOut[#mineOut + 1] = deadOut[i]
+    end
+    if not S.mirror then spawnMissing(theirs, known) end
     S.myEnemies = (#mineOut > 0) and table.concat(mineOut, " ") or nil
     S.myHunted = (#huntedOut > 0) and table.concat(huntedOut, " ") or nil
+end
+
+onRemoteEnemyDead = function(id)
+    if not on("sync_enemies") then return end
+    S.enemyDead[id] = true   -- the next enemy pass kills our copy, now or whenever it shows up
 end
 
 -- ================================================================ friendly fire
@@ -2367,7 +2454,7 @@ local function tick()
         S.doors, S.doorState = {}, {}   -- doors are reloaded with the level, so forget what we held
         S.cutPlayers, S.cutPlaying, S.cutRequest, S.cutExpected, S.regroupAt = {}, nil, nil, nil, nil
         S.itemState, S.takenRemote, S.itemSeen, S.itemSince, S.doorSeen = {}, {}, nil, nil, nil
-        S.enemies, S.enemyState = {}, {}
+        S.enemies, S.enemyState, S.enemyDead, S.spawnerById, S.spawnTried = {}, {}, {}, {}, {}
         S.puzzleState, S.solvedRemote, S.puzzleSeen, S.puzzleSince = {}, {}, nil, nil
         S.pushables, S.pushState, S.pushRemote, S.pushSeen = {}, {}, {}, nil
         S.pawnGone = true   -- menu, loading screen or death: the next time we exist, a load has finished
@@ -2445,7 +2532,8 @@ local function tick()
     end
 
     if on("sync_enemies") then
-        if S.tickCount % 60 == 11 then
+        if S.tickCount % 60 == 11 or S.enemiesDue then
+            S.enemiesDue = nil
             local ok, err = pcall(scanEnemies)
             if not ok then warnOnce("enemyscan:" .. tostring(err), "enemy scan error: " .. tostring(err)) end
         end

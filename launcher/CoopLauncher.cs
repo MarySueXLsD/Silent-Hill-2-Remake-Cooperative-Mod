@@ -507,7 +507,7 @@ namespace SH2CoopMod
 
     class MainForm : Form
     {
-        const string Version = "0.16";
+        const string Version = "0.17";
         const string Author = "MarySue";
         const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Mod";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
