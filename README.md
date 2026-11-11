@@ -37,7 +37,7 @@ The launcher:
 
 | | |
 |---|---|
-| **The other player** | Visible in your world with full-body animation, their equipped weapon, flashlight and radio, and a real flashlight beam that lights your surroundings |
+| **The other player** | Visible in your world with full-body animation, their equipped weapon, flashlight and radio, and a real flashlight beam that lights your surroundings. Their name floats above their head in white, also through walls, so you can always tell where they are |
 | **Inventory** | One inventory for both: ammunition, healing items, documents, weapons, keys and puzzle items. Each kind can be switched off |
 | **Pickups** | An item taken by one player is taken for both, with the game's own "collected" popup and "new" mark for both |
 | **Story moments** | Story triggers, one-shot events, switches, drawers and cupboard doors set off by one player go off in both games, and what the level hangs on a pickup ("when the coin is taken, ...") runs in both |
@@ -46,7 +46,7 @@ The launcher:
 | **Pushable objects** | Furniture one player pushes moves for both |
 | **Cutscenes** | Both players watch together, then carry on side by side where the host is |
 | **Enemies** | Same health for both, and a kill by one player is a death in both games, played as the enemy's own death. A hit that staggers or floors an enemy does the same in the other game, for the enemy kinds that take it. They hunt whichever player is closer |
-| **Gunshots** | The other player's shots are heard from where they stand, with a muzzle flash |
+| **Gunshots** | Every shot the other player fires is heard from where they stand, with the flash at the muzzle of their gun lighting up the room for a moment |
 | **Death** | One life for the pair: when either player dies, both restart from the host's last save. The one still standing is told why |
 | **Joining** | The joiner picks **Join co-op** in the game's main menu and loads straight into the host's game, beside them. No need to have the same save |
 | **Loading** | Whenever the host loads a save (or the pair restarts), the joiner is taken back through the main menu into that same load, by itself |
@@ -63,11 +63,14 @@ found, and when it is solved the story moves on for both.
 - The mod is new. Played between two PCs so far: joining from the main menu with the host's save
   copied across, the shared inventory and pickups, doors, puzzles, watching cutscenes together,
   F7, and reconnecting after a drop.
-- What came with 0.20 and 0.21 (story moments, dying together, following the host's loads,
-  enemy deaths and hit reactions, gunshots, pickup popups, unlimited ammo) has been checked on
-  one PC, by feeding the mod the other player's messages, and in one real session in which the
-  two players turned out to be on different versions of the mod. It has not yet been played
-  with both players on the same version. Please report what breaks.
+- What came with 0.20 to 0.22 (story moments, dying together, following the host's loads,
+  enemy deaths and hit reactions, gunshots, the name above the other player, pickup popups,
+  unlimited ammo) has been checked on one PC, by feeding the mod the other player's messages,
+  and in one real session in which the two players turned out to be on different versions of
+  the mod. It has not yet been played with both players on the same version. Please report
+  what breaks.
+- Gunshots only work from 0.22 on. Earlier versions listened for an event that most of the
+  game's firearms never raise, so the other player saw and heard nothing.
 - Not shared yet: half-finished puzzle progress (one player does the puzzle), bosses, sliding
   doors opening and closing, item containers and elevators. Press **F7** to jump to the other
   player if something separates you.
@@ -86,9 +89,14 @@ found, and when it is solved the story moves on for both.
   versions connect and look fine while much of the mod does nothing, so this is checked: the
   launcher updates the mod in the game folder before a session starts, and the launcher and the
   game both say so when the two games run different versions.
-- Joining from the main menu copies the host's current save to the joiner. It goes into a spare
-  save slot (number 9) that the game's own menus do not use; the joiner's own saves are left
-  alone.
+- Joining from the main menu copies the host's current save to the joiner. It goes into a slot
+  of its own (number 40), outside the 13 that the game's save and load lists show, so it never
+  appears among the joiner's saves and never lands on one. Up to 0.21 it was slot 9, which is
+  one of the game's ten save-point slots; the launcher removes that leftover co-op save, and
+  only that: a save of your own in slot 9 is left alone.
+- The joiner's game no longer saves along with the host's (it did up to 0.21, into the same
+  slot number, which could be a save the joiner had made themselves). The co-op run lives in the
+  host's saves; the joiner gets the host's current state every time they join.
 
 ## The launcher
 
@@ -131,6 +139,7 @@ players should use the same choices on the World page.
 | | Host's inventory wins on connect (it replaces the joiner's) | on |
 | | What is shared: ammunition / healing items / maps, notes and photos / weapons, keys and puzzle items | all on |
 | **Tweaks**, Other player | Show the other player | on |
+| | Name above their head (in white, also seen through walls) | on |
 | | Held items (weapon, flashlight and radio on their body) | on |
 | | Collision (their body blocks you, and enemies too) | off |
 | | Size | 100 % |
@@ -196,7 +205,8 @@ While you play:
 - When the host loads a save, the joiner is taken into that load the same way. With **Stay in
   the host's save** on (the default), a joiner who loads a save of their own is brought back
   into the host's game too.
-- **F9** toggles a solo test: the other player's body appears beside you and copies you.
+- **F9** toggles a solo test: the other player's body appears beside you and copies you, with
+  your own name above it, and it fires when you fire.
 
 If the two games do not connect:
 
@@ -277,17 +287,21 @@ agree, and where they cannot both be right, the host's game is the reference.
 - **Pushable objects** are driven by whoever is pushing: their game reports the object's
   position and the other game moves its copy with the pushable's own "teleport to" call. The
   resting place is sent once more as an event when they let go.
-- **Saving**: each PC keeps its own save files. When the host's game saves, the joiner's game
-  saves at the same moment (into the same slot number when the host used one), so the joiner's
-  own files keep up with the story.
+- **Saving**: each PC keeps its own save files, and the co-op run is the host's. The joiner's
+  game makes its own autosaves as usual but is not made to save when the host does: a save
+  written from outside a save point carries no location, and under the host's slot number it
+  could land on a save the joiner made themselves.
 - **Joining from the main menu**: while the joiner has no player yet, the mod adds an entry to
   the main menu, an engine-made copy of the game's own "Load game" entry with its click
   replaced. The host's game only sends packets while the host is in the game, so fresh packets
   switch the entry on. Picking it drops a request file; the joiner's launcher asks the host's
   launcher over TCP (same port number, and only the configured other player is answered); that
-  launcher tells its game to write a save into slot 9 and sends the file back; the joiner's
-  launcher stores it as its own slot 9, and the mod loads that slot with the menu's own
-  "load saved game" call. After loading, the joiner is placed beside the host.
+  launcher tells its game to write a save into slot 40 and sends the file back; the joiner's
+  launcher stores it as its own slot 40, and the mod loads that slot with the menu's own
+  "load saved game" call. After loading, the joiner is placed beside the host. The game has 13
+  save slots (three autosaves, ten save points) and its lists and "Continue" look at exactly
+  those; a higher number can be saved to and loaded from all the same, and no menu ever shows
+  it.
 - **Loading**: the joiner never loads a file of its own to follow the host. The host counts its
   loads and puts the number in every packet. A number other than the one the joiner joined at
   means the host is in a different load, so the joiner's game goes back to the main menu and
@@ -301,6 +315,10 @@ agree, and where they cannot both be right, the host's game is the reference.
   itself. A different world object, or the world's clock (which starts from zero in every
   freshly loaded world) running backwards, means a load went by, and everything remembered
   about the old level is dropped: the dead enemies, the taken pickups, the inventory count.
+- **Stepping out for a load**: when a load is about to start (a save picked in the menu,
+  "Continue", or the engine announcing a new map), the mod first removes everything it put
+  into the level, the other player's body and what hangs on it, and adds nothing until the
+  new level is running.
 - **Versions**: every packet names the version of the mod that wrote it. A newer mod sends
   things an older one does not know and simply skips, so two different versions connect and
   look fine while half of the mod does nothing. When the versions differ, the mod puts a line
@@ -329,8 +347,16 @@ agree, and where they cannot both be right, the host's game is the reference.
   is taken out of sight.
 - **Gunshots**: the other player's body copies their pose, so it aims and recoils, but a pose
   carries no muzzle flash and no sound. Every shot is sent as an event that names the weapon's
-  gunshot sound. The other game plays that sound from the body's gun hand and flashes a small
-  light there.
+  gunshot sound and says where the muzzle sits on the gun. The other game plays that sound at
+  the muzzle of the gun the body holds, starts the game's own muzzle-flash effect there and
+  lights the surroundings for a moment. A shot is noticed through the two calls the game itself
+  makes on every successful shot (it feeds them to its stress and statistics systems), and as a
+  net under that the mod watches the number of rounds in the clip: one fewer is a shot.
+- **The name above the other player** is a line of text on the game's own HUD, moved every
+  frame to the place on screen where the spot just above their head is. It is drawn on the HUD
+  and not in the world, so no wall covers it, and it hides with the HUD (pause, menus). The name
+  is the one typed into the launcher; it travels as hex digits, because the packets are plain
+  ASCII and a name need not be.
 - **Unlimited ammo**: about once a second the reserve of every kind of ammunition is filled
   back up to 60 rounds, so there is always something to reload with. A kind is covered from the
   first time the mod has seen it, in the inventory or named by a firearm in the level. Each
