@@ -738,7 +738,9 @@ namespace SH2CoopMod
         static Card PutCard(Control parent, string title, int x, int y, int w, int h)
         {
             Card c = new Card(title);
-            c.SetBounds(D(x), D(y), D(w), D(h));
+            // Far edges are scaled as positions, not as sizes: at 125 % two rounded-up halves
+            // (434 + 419) overshoot the page (852) by a pixel and the card loses its right border.
+            c.SetBounds(D(x), D(y), D(x + w) - D(x), D(y + h) - D(y));
             parent.Controls.Add(c);
             return c;
         }
@@ -921,7 +923,7 @@ namespace SH2CoopMod
             PutToggle(world, "sync_pushables", 16, 178, 303, "Pushable objects", "Furniture one of us pushes moves for both");
             PutToggle(world, "sync_cutscenes", 16, 224, 303, "Cutscenes", "Watch together, then regroup at the host");
             PutToggle(world, "sync_saves", 16, 270, 303, "Stay in the host's save", "When the host loads, the joiner joins that load");
-            PutToggle(world, "shared_death", 16, 316, 303, "Die together", "If one of us dies, both restart from the host's save");
+            PutToggle(world, "shared_death", 16, 316, 303, "Die together", "If one dies, both restart from the host's save");
 
             Card combat = PutCard(p, "Combat", 347, 0, 335, 260);
             PutToggle(combat, "sync_enemies", 16, 40, 303, "Shared enemies", "Same health and targets; they hunt both of us");
