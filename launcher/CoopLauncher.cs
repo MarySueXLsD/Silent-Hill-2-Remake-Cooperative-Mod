@@ -503,7 +503,7 @@ namespace CoopGhost
     {
         const string Version = "0.14";
         const string Author = "MarySue";
-        const string RepoUrl = "https://github.com/MarySueXLsD/SH2CoopGhost";
+        const string RepoUrl = "https://github.com/MarySueXLsD/Silent-Hill-2-Remake-Cooperative-Plugin";
         const string DefaultGame = @"C:\Program Files (x86)\SILENT HILL 2 REMAKE";
 
         static readonly string[] ModelKeys = { "james", "maria", "angela", "mary" };
